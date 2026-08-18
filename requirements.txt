@@ -1,0 +1,4 @@
+matplotlib>=3.8
+
+# Only the 2D frontend (frontends/visual.py) needs a third-party library.
+# The engine in johndeere/ and the console frontend are stdlib-only.
