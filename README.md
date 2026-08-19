@@ -10,6 +10,10 @@ python3 main.py --harvesters 3 --carts 2 --seed 42
 python3 main.py --frontend visual --harvesters 3 --carts 2 --save run.gif
 ```
 
+## Demo video
+
+[Demo video](assets/demo.webm)
+
 ---
 
 ## 1. File layout
