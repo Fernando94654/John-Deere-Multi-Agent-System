@@ -69,6 +69,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--fps", type=int, default=4, help="Frame rate when saving")
     parser.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="2D view only: hide the architecture panel",
+    )
+    parser.add_argument(
         "--no-animation",
         action="store_true",
         help="Console only: skip the replay and print the final frame",
@@ -112,7 +117,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         from frontends.visual import render
 
-        render(result, interval=args.interval, save=args.save, fps=args.fps)
+        render(
+            result,
+            interval=args.interval,
+            save=args.save,
+            fps=args.fps,
+            dashboard=not args.no_dashboard,
+        )
 
     return 0 if result.completed else 2
 

@@ -24,6 +24,7 @@ class TrafficControl:
         self.occupied: dict[Cell, str] = {}
         self.claimed: dict[Cell, str] = {}
         self.refusals = 0
+        self.grants = 0
 
     def begin_tick(self, agents: Iterable) -> None:
         """Record where everyone stands before anybody moves."""
@@ -46,6 +47,7 @@ class TrafficControl:
         """
         if cell == self.depot:
             self.occupied.pop(standing_on, None)
+            self.grants += 1
             return True
 
         holder = self.occupied.get(cell)
@@ -58,6 +60,7 @@ class TrafficControl:
         self.claimed[cell] = agent
         self.occupied.pop(standing_on, None)
         self.occupied[cell] = agent
+        self.grants += 1
         return True
 
     def blocker_at(self, cell: Optional[Cell]) -> Optional[str]:
