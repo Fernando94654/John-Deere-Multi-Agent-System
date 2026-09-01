@@ -40,13 +40,15 @@ def label_ink(hex_color: str) -> str:
     return INK if 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.6 else "#ffffff"
 
 
-def build_animation(result: SimulationResult, interval: int):
+def build_animation(result: SimulationResult, interval: int, dashboard: bool = True):
     """Assemble the figure and the FuncAnimation that replays the run."""
     import numpy as np
     from matplotlib import pyplot as plt
     from matplotlib.animation import FuncAnimation
     from matplotlib.colors import ListedColormap, to_rgb
     from matplotlib.patches import Patch
+
+    from .dashboard import ArchitecturePanel
 
     replay = [([row[:] for row in grid], snap) for grid, snap in frames(result)]
     rows = len(result.initial_grid)
@@ -55,16 +57,34 @@ def build_animation(result: SimulationResult, interval: int):
     total_food = sum(row.count(FOOD) for row in result.initial_grid)
     machines = [*result.harvesters, *result.carts]
 
-    fig = plt.figure(
-        figsize=(min(17.0, 5.0 + cols * 0.42), min(10.5, max(5.0, rows * 0.46))),
-        facecolor=SURFACE,
-    )
-    spec = fig.add_gridspec(
-        2, 2, width_ratios=[3, 1.15], height_ratios=[3, 1.4], wspace=0.14, hspace=0.3
-    )
-    ax_field = fig.add_subplot(spec[:, 0])
-    ax_bars = fig.add_subplot(spec[0, 1])
-    ax_info = fig.add_subplot(spec[1, 1])
+    width = min(19.0, 5.0 + cols * 0.42)
+    height = min(10.5, max(5.0, rows * 0.42))
+    if dashboard:
+        # The diagram is wide and flat, so it gets a full-width row of its own
+        # underneath. Squeezed into the side column its labels ran off the edge.
+        fig = plt.figure(figsize=(width, height * 1.45), facecolor=SURFACE)
+        spec = fig.add_gridspec(
+            2, 2,
+            width_ratios=[3, 1.15],
+            height_ratios=[2.6, 1.25],
+            wspace=0.14, hspace=0.22,
+        )
+        ax_field = fig.add_subplot(spec[0, 0])
+        ax_side = fig.add_subplot(spec[0, 1])
+        ax_side.set_axis_off()
+        inner = ax_side.get_subplotspec().subgridspec(2, 1, height_ratios=[3, 1.5], hspace=0.35)
+        ax_bars = fig.add_subplot(inner[0])
+        ax_info = fig.add_subplot(inner[1])
+        ax_arch = fig.add_subplot(spec[1, :])
+    else:
+        fig = plt.figure(figsize=(width, height), facecolor=SURFACE)
+        spec = fig.add_gridspec(
+            2, 2, width_ratios=[3, 1.15], height_ratios=[3, 1.4], wspace=0.14, hspace=0.3
+        )
+        ax_field = fig.add_subplot(spec[:, 0])
+        ax_bars = fig.add_subplot(spec[0, 1])
+        ax_arch = None
+        ax_info = fig.add_subplot(spec[1, 1])
 
     # --- the field ---------------------------------------------------------
     display = np.array([[TERRAIN_INDEX[v] for v in row] for row in result.initial_grid])
@@ -171,12 +191,24 @@ def build_animation(result: SimulationResult, interval: int):
     # --- counters ----------------------------------------------------------
     ax_info.set_axis_off()
     status = ax_info.text(
-        0, 1.0, "", va="top", fontsize=9, color=INK, linespacing=1.55
+        0, 1.05, "", va="top", fontsize=8.5, color=INK, linespacing=1.5
     )
-    ax_info.barh([0.04], [1.0], height=0.09, color=TRACK)
-    progress = ax_info.barh([0.04], [0.0], height=0.09, color=INK_MUTED)
+    ax_info.barh([-0.16], [1.0], height=0.08, color=TRACK)
+    progress = ax_info.barh([-0.16], [0.0], height=0.08, color=INK_MUTED)
     ax_info.set_xlim(0, 1)
-    ax_info.set_ylim(0, 1)
+    ax_info.set_ylim(-0.24, 1.05)
+
+    panel = (
+        ArchitecturePanel(
+            ax_arch,
+            {
+                "accent": HARVESTER_COLORS[0], "muted": "#c3c7bd",
+                "wash": TRACK, "surface": SURFACE, "ink": INK, "faint": INK_MUTED,
+            },
+        )
+        if ax_arch is not None
+        else None
+    )
 
     def update(index: int):
         grid, snapshot = replay[index]
@@ -215,12 +247,13 @@ def build_animation(result: SimulationResult, interval: int):
         status.set_text(
             f"Delivered to farm   {m.delivered}\n"
             f"In transit          {m.in_transit}\n"
-            f"Fuel                {m.fuel:.0f} L\n"
-            f"CO2                 {m.co2:.0f} kg\n"
+            f"Fuel / CO2          {m.fuel:.0f} L  ·  {m.co2:.0f} kg\n"
             f"Idle                {m.idle_ticks} ticks"
         )
         progress[0].set_width(m.harvested / total_food if total_food else 0)
-        return [image, *(d for d, _ in markers), *noses, *spouts, *bars, status]
+
+        lit = panel.update(snapshot.activity) if panel is not None else []
+        return [image, *(d for d, _ in markers), *noses, *spouts, *bars, status, *lit]
 
     animation = FuncAnimation(
         fig, update, frames=len(replay), interval=interval, blit=False, repeat=False
@@ -229,13 +262,17 @@ def build_animation(result: SimulationResult, interval: int):
 
 
 def render(
-    result: SimulationResult, interval: int = 120, save: str | None = None, fps: int = 8
+    result: SimulationResult,
+    interval: int = 120,
+    save: str | None = None,
+    fps: int = 8,
+    dashboard: bool = True,
 ) -> None:
     """Show the run in a window, or write it to a GIF when `save` is given."""
     from matplotlib import pyplot as plt
     from matplotlib.animation import PillowWriter
 
-    fig, animation = build_animation(result, interval)
+    fig, animation = build_animation(result, interval, dashboard)
     if save:
         animation.save(save, writer=PillowWriter(fps=fps))
         plt.close(fig)

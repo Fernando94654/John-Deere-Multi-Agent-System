@@ -88,23 +88,29 @@ class Dispatcher:
         harvesters: dict[int, "Harvester"],
         carts: list["GrainCart"],
         tick: int,
-    ) -> None:
-        """Assign free carts to open requests, cheapest bid first."""
+    ) -> tuple[int, int]:
+        """Assign free carts to open requests, cheapest bid first.
+
+        Returns `(bids evaluated, carts assigned)` so the dashboard can show
+        when the auction actually ran.
+        """
+        bids_made = assigned = 0
         open_requests = self.pending
         if not open_requests:
-            return
+            return bids_made, assigned
         self.auctions_run += 1
 
         available = [cart for cart in carts if cart.available]
         for request in sorted(open_requests, key=lambda r: r.posted_tick):
             if not available:
-                return
+                break
             harvester = harvesters[request.harvester_id]
             bids = [
                 (bid, cart.id, cart)
                 for cart in available
                 if (bid := self.bid(field, cart, harvester, tick)) is not None
             ]
+            bids_made += len(bids)
             if not bids:
                 continue
             _, _, winner = min(bids, key=lambda item: (item[0], item[1]))
@@ -112,3 +118,5 @@ class Dispatcher:
             harvester.cart_id = winner.id
             request.served_by = winner.id
             available.remove(winner)
+            assigned += 1
+        return bids_made, assigned

@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dataclass_field
 from typing import Callable, Optional
 
+from .activity import TickActivity
 from .agents.grain_cart import CartState, GrainCart
 from .agents.harvester import Harvester, HarvesterState
 from .config import BLOCKED_TICKS_BEFORE_REROUTE, HARVESTER_TANK, SimulationConfig
@@ -48,6 +49,8 @@ class Snapshot:
     carts: tuple[AgentView, ...]
     harvested_cells: tuple[Cell, ...]
     metrics: FleetMetrics
+    #: What each part of the architecture did during this tick.
+    activity: TickActivity = TickActivity()
 
 
 @dataclass
@@ -103,6 +106,7 @@ class Simulation:
 
         self.dispatcher = Dispatcher()
         self.traffic = TrafficControl(depot=self.farm)
+        self.give_ways = 0
         self.tick = 0
         self.delivered = 0
         self.collisions = 0
@@ -186,6 +190,7 @@ class Simulation:
 
     def _give_way(self, agent, target: Cell) -> bool:
         """Try to get a stuck machine moving again; returns True if it moved."""
+        self.give_ways += 1
         blocker = self._agent_at(self.traffic.blocker_at(target))
         if (
             blocker is not None
@@ -241,14 +246,19 @@ class Simulation:
     def step(self) -> Snapshot:
         """Advance the whole world by one tick and return the new snapshot."""
         self.tick += 1
+        posted = 0
 
         for harvester in self.harvesters:
             # A harvester calls for a cart at the threshold, and also when it has
             # finished its zone holding a part-load that is under the threshold.
             waiting_with_grain = harvester.state is HarvesterState.WAITING_CART
             if (harvester.wants_cart or waiting_with_grain) and harvester.load > 0:
+                before = len(self.dispatcher.requests)
                 self.dispatcher.post(harvester, self.tick)
-        self.dispatcher.run_auctions(self.field, self.by_id, self.carts, self.tick)
+                posted += len(self.dispatcher.requests) > before
+        bids, assignments = self.dispatcher.run_auctions(
+            self.field, self.by_id, self.carts, self.tick
+        )
 
         # Grain moves before anybody drives. A tank that hit 100% last tick then
         # already has room by the time its harvester decides, so a coupled pair
@@ -257,6 +267,11 @@ class Simulation:
 
         self.traffic.begin_tick(self.agents)
         harvested: list[Cell] = []
+        claims_before = self.traffic.grants
+        refusals_before = self.traffic.refusals
+        give_ways_before = self.give_ways
+        moved_before = {a.label: a.distance for a in self.agents}
+        delivered_before = self.delivered
 
         for harvester in self.harvesters:
             harvester.decide(self.field, self._cart_beside(harvester))
@@ -285,12 +300,41 @@ class Simulation:
                 self._move(cart, productive=cart.id in unloading)
 
         self._audit()
+
+        def drove(machines):
+            return sum(1 for m in machines if m.distance > moved_before[m.label])
+
+        activity = TickActivity(
+            requests_posted=posted,
+            open_requests=len(self.dispatcher.requests),
+            bids_evaluated=bids,
+            traffic_claims=self.traffic.grants - claims_before,
+            traffic_refusals=self.traffic.refusals - refusals_before,
+            give_ways=self.give_ways - give_ways_before,
+            assignments=assignments,
+            coalitions=sum(1 for c in self.carts if c.target_id is not None),
+            harvest_moves=drove(self.harvesters),
+            cuts=len(harvested),
+            rotations=sum(
+                1 for h in self.harvesters if h.state is HarvesterState.ROTATING
+            ),
+            waiting=sum(
+                1
+                for h in self.harvesters
+                if h.state in (HarvesterState.WAITING_CART, HarvesterState.UNLOADING)
+            ),
+            cart_moves=drove(self.carts),
+            transfers=len(unloading),
+            deliveries=self.delivered - delivered_before,
+        )
+
         snapshot = Snapshot(
             tick=self.tick,
             harvesters=tuple(self._view(h) for h in self.harvesters),
             carts=tuple(self._view(c) for c in self.carts),
             harvested_cells=tuple(harvested),
             metrics=self._metrics(),
+            activity=activity,
         )
         return snapshot
 
