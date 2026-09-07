@@ -243,23 +243,26 @@ metric.
 
 ```
 to zone ──► harvesting ──► waiting cart ──► returning ──► done
-                │  ▲            │
-                ▼  │            ▼
-            rotating ──────► unloading
+                │  ▲            │                 ▲
+                ▼  │            ▼                 │
+            rotating ──────► unloading ───────────┘
 ```
 
 | State | What it is doing |
 |---|---|
 | `to zone` | Driving from the farm to its zone |
 | `harvesting` | Sweeping its zone; cuts the cell it stands on |
-| `waiting cart` | Tank full (or zone finished with grain aboard) and no cart alongside |
+| `waiting cart` | Tank full **with crop still to cut** and no cart alongside |
 | `rotating` | Turning 90° to bring the spout round to the cart |
 | `unloading` | Stopped, cart on its left, passing grain across |
-| `returning` | Zone finished and tank empty: driving home |
+| `returning` | Zone finished: driving home, with whatever is still in the tank |
 | `done` | Parked at the farm, day over |
 
-It calls for a cart at the threshold and **keeps cutting** while it waits. It only stops if
-it fills up with no cart docked, or if it finishes its zone with grain aboard.
+It calls for a cart at the threshold and **keeps cutting** while it waits. It only stands
+still if it fills up with no cart docked *and* there is still crop to cut. Once its zone is
+finished it stops waiting for anyone: it drives home and empties into the silo itself, which
+is credited exactly like a cart's delivery. That trip happens either way — waiting for a
+cart only added dead time to it.
 
 ### 4.2 Grain cart (`agents/grain_cart.py`)
 
@@ -297,8 +300,8 @@ The order of the phases is not decorative — each one is where it is for a reas
 7. **Audit**: the two hard invariants are checked (no collision, nobody on a rock) and the
    `Snapshot` is emitted.
 
-**End of campaign**: no reachable crop left, every harvester back at the farm, and every
-cart empty and parked. `max_ticks` is the safety net.
+**End of campaign**: no reachable crop left, every harvester back at the farm with an empty
+tank, and every cart empty and parked. `max_ticks` is the safety net.
 
 ---
 
@@ -351,7 +354,8 @@ Checked over 56 configurations (8 seeds × 7 fleets), on fields with and without
 - The campaign always **finishes**, and `harvested == delivered` with no grain lost.
 - **Zero collisions** and **zero machines on obstacles**.
 - No cart **ever** drives on standing crop.
-- **Every** transfer happens with the cart on the left-hand side.
+- **Every** cart transfer happens with the cart on the left-hand side. (A harvester that
+  finished its zone empties straight into the silo, with no cart involved.)
 - A* is optimal (it matches BFS) and its routes are contiguous and drivable.
 - Zones are connected, disjoint, and cover everything reachable.
 

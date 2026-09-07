@@ -1,7 +1,9 @@
 """The harvester: sweeps its zone, fills its tank, calls for a grain cart.
 
-A harvester never drives its grain to the farm itself — that is the cart's job.
-It calls for one at `REQUEST_THRESHOLD` and keeps working while it waits.
+While there is crop left to cut, a harvester does not drive its own grain to the
+farm — that is the cart's job. It calls for one at `REQUEST_THRESHOLD` and keeps
+working while it waits. Once its zone is finished, though, it stops waiting and
+takes whatever is left in the tank home itself.
 
 Grain leaves over the left-hand side. A cart cannot drive on standing crop, so
 more often than not the only cut ground beside the harvester is somewhere other
@@ -82,8 +84,8 @@ class Harvester(Agent):
         return self.plan[0] if self.plan else None
 
     def needs_unloading(self, field: Field) -> bool:
-        """True when this machine cannot go on until a cart takes its grain."""
-        return self.load > 0 and (self.full or self.next_target(field) is None)
+        """True when a full tank with crop still to cut pins the machine down."""
+        return self.load > 0 and self.full and self.next_target(field) is not None
 
     def decide(
         self,
@@ -119,8 +121,7 @@ class Harvester(Agent):
                 self.state = HarvesterState.ROTATING
             return
 
-        # A full tank — or a finished zone with grain still aboard — stops the
-        # machine until a cart reaches it.
+        # A finished zone is not a reason to wait: it falls through below.
         if self.needs_unloading(field):
             self.state = HarvesterState.WAITING_CART
             self.follow(None)
@@ -128,7 +129,7 @@ class Harvester(Agent):
 
         target = self.next_target(field)
         if target is None:
-            # Nothing left to cut and nothing left to hand over: drive home.
+            # Nothing left to cut: drive home, carrying whatever is still aboard.
             self.state = HarvesterState.RETURNING
             if self.position == field.farm:
                 self.state = HarvesterState.DONE
