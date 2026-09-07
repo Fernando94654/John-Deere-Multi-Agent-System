@@ -128,7 +128,11 @@ class Simulation:
         """True when the campaign is over: field cut, grain delivered, everyone home."""
         return (
             self.food_left_reachable() == 0
-            and all(h.state is HarvesterState.DONE for h in self.harvesters)
+            # The load check catches grain that reached the farm uncredited.
+            and all(
+                h.state is HarvesterState.DONE and h.load == 0
+                for h in self.harvesters
+            )
             and all(
                 c.load == 0 and c.position == self.farm and c.state is CartState.IDLE
                 for c in self.carts
@@ -143,6 +147,17 @@ class Simulation:
         if cart.target_id != harvester.id:
             return None
         return cart.position if manhattan(cart.position, harvester.position) == 1 else None
+
+    def _release_cart(self, harvester: Harvester) -> None:
+        """Cancel the pairing, so the cart stops chasing a machine that left."""
+        if harvester.cart_id is None:
+            self.dispatcher.close(harvester)
+            return
+
+        # `close` clears `cart_id`, so the cart has to be looked up first.
+        cart = self.carts[harvester.cart_id]
+        self.dispatcher.close(harvester)
+        cart.release()
 
     def _priority(self, agent) -> int:
         """Right of way, lowest number first: harvesters by id, then carts.
@@ -243,10 +258,12 @@ class Simulation:
         self.tick += 1
 
         for harvester in self.harvesters:
-            # A harvester calls for a cart at the threshold, and also when it has
-            # finished its zone holding a part-load that is under the threshold.
-            waiting_with_grain = harvester.state is HarvesterState.WAITING_CART
-            if (harvester.wants_cart or waiting_with_grain) and harvester.load > 0:
+            # One already heading home needs no cart: it empties its own tank.
+            going_home = harvester.state in (
+                HarvesterState.RETURNING,
+                HarvesterState.DONE,
+            )
+            if harvester.wants_cart and harvester.load > 0 and not going_home:
                 self.dispatcher.post(harvester, self.tick)
         self.dispatcher.run_auctions(self.field, self.by_id, self.carts, self.tick)
 
@@ -260,6 +277,9 @@ class Simulation:
 
         for harvester in self.harvesters:
             harvester.decide(self.field, self._cart_beside(harvester))
+            if harvester.state is HarvesterState.RETURNING:
+                self._release_cart(harvester)
+
             if harvester.state in (HarvesterState.HARVESTING, HarvesterState.TO_ZONE):
                 self._move(harvester)
                 cell = harvester.work(self.field)
@@ -267,6 +287,9 @@ class Simulation:
                     harvested.append(cell)
             elif harvester.state is HarvesterState.RETURNING:
                 self._move(harvester)
+                # Grain carried home counts as delivered just like a cart's load.
+                if harvester.position == self.farm and harvester.load > 0:
+                    self.delivered += harvester.receive_from_tank(harvester.load)
                 harvester.decide(self.field, self._cart_beside(harvester))
             else:
                 # Waiting, turning on the spot or being emptied: all stand still.

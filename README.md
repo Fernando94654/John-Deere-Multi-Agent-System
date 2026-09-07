@@ -1,13 +1,16 @@
 # John-Deere-Multi-Agent-System
 
 A multi-agent simulation of a harvest campaign: several **harvesters** sweep a field and
-hand their grain to several mobile **grain carts**, which ferry it to the **farm**. Pure
-Python, with no dependency beyond `matplotlib` for the 2D view.
+hand their grain to several mobile **grain carts**, which ferry it to the **farm**. The
+engine is pure standard library; `matplotlib` is only needed by the 2D view, and
+`websockets` only by the Unity bridge (§10).
 
 ```bash
 python3 main.py --frontend visual --harvesters 3 --carts 3 --seed 42 --interval 125
 python3 main.py --harvesters 3 --carts 2 --seed 42
 python3 main.py --frontend visual --harvesters 3 --carts 2 --save run.gif
+
+python3 Servidor/server.py            # stream a run to Unity over WebSocket
 ```
 
 ---
@@ -38,16 +41,20 @@ frontends/
   replay.py                   rebuilding the field tick by tick
   console.py                  ASCII render + ANSI animation
   visual.py                   2D animation with matplotlib
+Servidor/
+  server.py                   WebSocket bridge to the Unity client (§10)
 ```
 
 Dependencies run one way only:
 
 ```
 world  ->  planning  ->  agents  ->  coordination  ->  simulation  ->  frontends
+                                                                 \->  Servidor
 ```
 
 **The engine never prints or draws.** Frontends observe a run through an immutable
-`Snapshot` per tick, which is the only contract between the two sides.
+`Snapshot` per tick, which is the only contract between the two sides. The Unity bridge
+is just another consumer of that same `Snapshot`, over a socket instead of a screen.
 
 ---
 
@@ -236,23 +243,26 @@ metric.
 
 ```
 to zone ──► harvesting ──► waiting cart ──► returning ──► done
-                │  ▲            │
-                ▼  │            ▼
-            rotating ──────► unloading
+                │  ▲            │                 ▲
+                ▼  │            ▼                 │
+            rotating ──────► unloading ───────────┘
 ```
 
 | State | What it is doing |
 |---|---|
 | `to zone` | Driving from the farm to its zone |
 | `harvesting` | Sweeping its zone; cuts the cell it stands on |
-| `waiting cart` | Tank full (or zone finished with grain aboard) and no cart alongside |
+| `waiting cart` | Tank full **with crop still to cut** and no cart alongside |
 | `rotating` | Turning 90° to bring the spout round to the cart |
 | `unloading` | Stopped, cart on its left, passing grain across |
-| `returning` | Zone finished and tank empty: driving home |
+| `returning` | Zone finished: driving home, with whatever is still in the tank |
 | `done` | Parked at the farm, day over |
 
-It calls for a cart at the threshold and **keeps cutting** while it waits. It only stops if
-it fills up with no cart docked, or if it finishes its zone with grain aboard.
+It calls for a cart at the threshold and **keeps cutting** while it waits. It only stands
+still if it fills up with no cart docked *and* there is still crop to cut. Once its zone is
+finished it stops waiting for anyone: it drives home and empties into the silo itself, which
+is credited exactly like a cart's delivery. That trip happens either way — waiting for a
+cart only added dead time to it.
 
 ### 4.2 Grain cart (`agents/grain_cart.py`)
 
@@ -290,8 +300,8 @@ The order of the phases is not decorative — each one is where it is for a reas
 7. **Audit**: the two hard invariants are checked (no collision, nobody on a rock) and the
    `Snapshot` is emitted.
 
-**End of campaign**: no reachable crop left, every harvester back at the farm, and every
-cart empty and parked. `max_ticks` is the safety net.
+**End of campaign**: no reachable crop left, every harvester back at the farm with an empty
+tank, and every cart empty and parked. `max_ticks` is the safety net.
 
 ---
 
@@ -344,7 +354,8 @@ Checked over 56 configurations (8 seeds × 7 fleets), on fields with and without
 - The campaign always **finishes**, and `harvested == delivered` with no grain lost.
 - **Zero collisions** and **zero machines on obstacles**.
 - No cart **ever** drives on standing crop.
-- **Every** transfer happens with the cart on the left-hand side.
+- **Every** cart transfer happens with the cart on the left-hand side. (A harvester that
+  finished its zone empties straight into the silo, with no cart involved.)
 - A* is optimal (it matches BFS) and its routes are contiguous and drivable.
 - Zones are connected, disjoint, and cover everything reachable.
 
@@ -389,3 +400,106 @@ print('ok')
   each unload to the nearest one.
 - **Soil sensors (moisture, fertility) and ripeness-based priority** are out of scope: the
   challenge brief suggests them but does not require them.
+
+---
+
+## 10. The Unity bridge (`Servidor/server.py`)
+
+A WebSocket server that drives the engine and streams the world to a Unity client. It is
+a frontend like any other: it consumes the same `Snapshot` the console and 2D views do,
+and adds nothing to `johndeere/`.
+
+```bash
+python3 Servidor/server.py                        # ws://localhost:8765
+python3 Servidor/server.py --rows 14 --cols 18 --delay 0.3 --seed 42
+```
+
+Each connection gets its own `Session`: its own `Simulation`, its own seed and its own
+run counter. Two tasks run side by side — one reads commands, one writes states. Every
+send goes through the writer, because `websockets` gives no guarantee for concurrent
+sends from two coroutines.
+
+### 10.1 Commands (Unity → server)
+
+| Command | Payload | Effect |
+|---|---|---|
+| `start` | `rows`, `columns` | Builds the simulation and begins streaming |
+| `pause` | — | Stops advancing ticks |
+| `resume` | — | Continues from the tick where it stopped |
+| `restart` | `rows`, `columns`, `newSeed` (all optional) | Rebuilds from tick 1 |
+
+```jsonc
+{"command": "start",   "rows": 10, "columns": 12}
+{"command": "pause"}
+{"command": "resume"}
+{"command": "restart"}                    // same field, from the top
+{"command": "restart", "newSeed": true}   // a freshly drawn field
+```
+
+Nothing is simulated until a `start` arrives, so the operator's chosen field size is what
+gets built. A message with **no** `command` counts as `start`, which is the handshake the
+Unity client used before the control buttons existed.
+
+The seed is pinned on the first run and reused on every restart, so Restart reproduces
+the identical field — you can rehearse a demo and repeat it. `newSeed` draws a new one.
+
+Sizes below **6×6** are refused: `border` cells of headland are bare on every side, so a
+smaller field has no crop and the run would end instantly. Malformed JSON, unknown
+commands and invalid sizes are logged and ignored; the connection survives all three.
+
+### 10.2 State (server → Unity)
+
+One message per tick. Shaped for Unity's `JsonUtility`, which deserializes **neither
+nested arrays nor dictionaries** — hence the flat crop array and the fixed field names.
+
+```jsonc
+{
+  "tick": 1,
+  "tickInterval": 0.5,              // seconds until the next state
+  "status": "running",              // "running" | "paused" | "finished"
+  "runId": 1,                       // increases on every restart
+  "grid":      { "rows": 6, "columns": 6 },
+  "crop":      { "cells": [0, 0, 0, 1, ...] },        // row-major, rows*columns long
+  "obstacles": { "count": 3, "positions": [{"row": 1, "column": 2}, ...] },
+  "silos":     { "count": 1, "positions": [{"row": 0, "column": 0}] },
+  "tractors": [                     // the engine's grain carts
+    { "id": "C0", "row": 0, "column": 0, "route": [],
+      "state": "idle", "load": 0, "capacity": 60,
+      "heading": {"row": 0, "column": 1} }
+  ],
+  "harvesters": [
+    { "id": "H0", "row": 1, "column": 0,
+      "route": [{"row": 2, "column": 0}, ...],        // remaining path
+      "state": "to zone", "load": 0, "capacity": 20,
+      "heading": {"row": 1, "column": 0} }
+  ],
+  "metrics": { "harvested": 0, "delivered": 0, "inTransit": 0,
+               "distance": 2, "fuel": 1.7, "co2": 4.56 }
+}
+```
+
+| Field | Why it is there |
+|---|---|
+| `crop.cells` | `-1` rock, `0` cut, `1` standing. Sent **whole every tick** rather than as deltas, so a dropped message cannot leave the client permanently out of sync. |
+| `heading` | A `(row, column)` step. An agent stands still on roughly half the ticks, so a client that infers facing from consecutive positions has nothing to work with; sending it also makes the spout rotation visible. |
+| `tickInterval` | Lets the client spread one cell of travel over exactly one tick, whatever its own cell size is. |
+| `runId` | The only way for the client to tell a restart from one more tick, so it knows when to clear the previous field. |
+| `status` | Saves the client from inferring the run state. While paused the server re-sends the **whole** last state rather than a bare status, because the Unity client drops any message missing `grid`, `obstacles`, `silos`, `tractors` or `harvesters`. |
+| `tractors` | The engine has harvesters and grain carts; `tractors` is the carts, named for the prefab Unity draws them with. |
+
+Coordinates are the engine's: `row` grows downward, `column` rightward, `index = row *
+columns + column`. The farm at `(0, 0)` is reported as the single silo.
+
+When the campaign ends the server keeps republishing the final state with
+`status: "finished"` instead of going quiet, so the field stays on screen while the
+presenter talks. A `restart` after that works normally.
+
+### 10.3 Parameters
+
+`--rows`, `--cols`, `--harvesters`, `--carts`, `--border`, `--min-obstacles`,
+`--max-obstacles`, `--seed`, `--delay` (seconds per tick, default `0.5`), `--host`,
+`--port` (default `8765`).
+
+`--rows`/`--cols` are only the fallback: the client's `start` decides the real size. The
+defaults are small because Unity draws each cell 20 world units wide, and a large field
+falls outside the framing of the presentation cameras.
