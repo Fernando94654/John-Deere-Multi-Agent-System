@@ -43,6 +43,15 @@ frontends/
   visual.py                   2D animation with matplotlib
 Servidor/
   server.py                   WebSocket bridge to the Unity client (§10)
+  agent/                      MCP supervision layer (§11)
+    tools.py                  what the supervisor may read and change
+    policy.py                 the gate every command passes, and the audit trail
+    watcher.py                what wakes the agent when the fleet gets stuck
+agent/
+  skills/farm-manager/        the OpenClaw skill: doctrine, not capability
+  openclaw.example.json5      MCP registration, model backends, chat channel
+  run-demo.sh                 brings up the gateway and the simulation together
+  orin-model.sh               runs the local model in a container on the Jetson
 ```
 
 Dependencies run one way only:
@@ -50,6 +59,7 @@ Dependencies run one way only:
 ```
 world  ->  planning  ->  agents  ->  coordination  ->  simulation  ->  frontends
                                                                  \->  Servidor
+                                                                       \->  agent
 ```
 
 **The engine never prints or draws.** Frontends observe a run through an immutable
@@ -307,8 +317,9 @@ tank, and every cart empty and parked. `max_ticks` is the safety net.
 
 ## 6. Metrics (`metrics.py`)
 
-Per machine: distance, fuel, idle ticks. Per fleet: harvested, delivered, in transit, CO₂
-(`litres × 2.68`), litres per unit delivered, and right-of-way stops.
+Per machine: distance, fuel, idle ticks. Per fleet: harvested, delivered, in transit,
+stranded (grain aboard a machine that broke down), CO₂ (`litres × 2.68`), litres per unit
+delivered, and right-of-way stops.
 
 They are what sizes the fleet, which is where the system is best seen at work. A 14×20
 field on the default settings, averaged over 4 seeds:
@@ -400,6 +411,10 @@ print('ok')
   each unload to the nearest one.
 - **Soil sensors (moisture, fertility) and ripeness-based priority** are out of scope: the
   challenge brief suggests them but does not require them.
+- **The fleet can grow but not shrink.** Carts are looked up by `carts[id]`, so ids must
+  stay equal to the index; appending preserves that and removing does not.
+- **A broken machine strands its grain.** It is reported as `stranded` rather than quietly
+  credited, so `harvested == delivered` becomes `harvested == delivered + in_transit`.
 
 ---
 
@@ -423,10 +438,10 @@ sends from two coroutines.
 
 | Command | Payload | Effect |
 |---|---|---|
-| `start` | `rows`, `columns` | Builds the simulation and begins streaming |
+| `start` | `rows`, `columns` | **Joins the run in progress**, or builds the first one at this size |
 | `pause` | — | Stops advancing ticks |
 | `resume` | — | Continues from the tick where it stopped |
-| `restart` | `rows`, `columns`, `newSeed` (all optional) | Rebuilds from tick 1 |
+| `restart` | `rows`, `columns`, `newSeed` (all optional) | Rebuilds from tick 1, at a new size if asked |
 
 ```jsonc
 {"command": "start",   "rows": 10, "columns": 12}
@@ -440,12 +455,30 @@ Nothing is simulated until a `start` arrives, so the operator's chosen field siz
 gets built. A message with **no** `command` counts as `start`, which is the handshake the
 Unity client used before the control buttons existed.
 
+**`start` is idempotent, and that matters.** Once a run exists it joins it and ignores the
+size arguments; only `restart` rebuilds. It used to do both, which was harmless when every
+connection got its own run and destructive once `--with-mcp` made the world shared: the
+Unity handshake tore down the campaign the operator had just started and rebuilt it at the
+client's own field size, and since a message with no command *is* a `start`, so did any
+unexpected message. Tearing down a live campaign has to be something you ask for on
+purpose.
+
 The seed is pinned on the first run and reused on every restart, so Restart reproduces
 the identical field — you can rehearse a demo and repeat it. `newSeed` draws a new one.
 
 Sizes below **6×6** are refused: `border` cells of headland are bare on every side, so a
-smaller field has no crop and the run would end instantly. Malformed JSON, unknown
-commands and invalid sizes are logged and ignored; the connection survives all three.
+smaller field has no crop and the run would end instantly.
+
+A field is also refused when **the fleet has nothing to do on it**: each harvester needs
+roughly `REQUEST_THRESHOLD × HARVESTER_TANK` reachable crop cells before it ever fills up
+far enough to call a cart. Below that the carts never leave the farm and the harvesters
+carry their own grain home — every rule working exactly as written, and nothing worth
+watching. Four harvesters on a 6×6 field get twelve cells between them, which is how this
+check came to exist.
+
+The candidate run is built and checked *before* it is adopted, so a refusal leaves the
+campaign already on screen ticking along. Malformed JSON, unknown commands, invalid sizes
+and unworkable fleets are all logged and ignored; the connection survives every one.
 
 ### 10.2 State (server → Unity)
 
@@ -460,6 +493,8 @@ nested arrays nor dictionaries** — hence the flat crop array and the fixed fie
   "runId": 1,                       // increases on every restart
   "grid":      { "rows": 6, "columns": 6 },
   "crop":      { "cells": [0, 0, 0, 1, ...] },        // row-major, rows*columns long
+  "zones":     { "cells": [0, 0, 1, -1, ...] },       // owning harvester per cell, -1 none
+  "narration": { "text": "", "tick": 0 },             // the supervisor's last word (§11)
   "obstacles": { "count": 3, "positions": [{"row": 1, "column": 2}, ...] },
   "silos":     { "count": 1, "positions": [{"row": 0, "column": 0}] },
   "tractors": [                     // the engine's grain carts
@@ -473,7 +508,7 @@ nested arrays nor dictionaries** — hence the flat crop array and the fixed fie
       "state": "to zone", "load": 0, "capacity": 20,
       "heading": {"row": 1, "column": 0} }
   ],
-  "metrics": { "harvested": 0, "delivered": 0, "inTransit": 0,
+  "metrics": { "harvested": 0, "delivered": 0, "inTransit": 0, "stranded": 0,
                "distance": 2, "fuel": 1.7, "co2": 4.56 }
 }
 ```
@@ -486,6 +521,8 @@ nested arrays nor dictionaries** — hence the flat crop array and the fixed fie
 | `runId` | The only way for the client to tell a restart from one more tick, so it knows when to clear the previous field. |
 | `status` | Saves the client from inferring the run state. While paused the server re-sends the **whole** last state rather than a bare status, because the Unity client drops any message missing `grid`, `obstacles`, `silos`, `tractors` or `harvesters`. |
 | `tractors` | The engine has harvesters and grain carts; `tractors` is the carts, named for the prefab Unity draws them with. |
+| `zones` | Which harvester owns each cell, flat and row-major for the same reason as `crop`. It is what lets Unity tint the ground: when the supervisor redraws the zones (§11), the boundary between colours moves on screen mid-run. |
+| `narration` | One line from the supervisor explaining what it just did, to caption under the field. Empty until an agent is connected. |
 
 Coordinates are the engine's: `row` grows downward, `column` rightward, `index = row *
 columns + column`. The farm at `(0, 0)` is reported as the single silo.
@@ -500,6 +537,420 @@ presenter talks. A `restart` after that works normally.
 `--max-obstacles`, `--seed`, `--delay` (seconds per tick, default `0.5`), `--host`,
 `--port` (default `8765`).
 
+For the supervision layer (§11): `--with-mcp`, `--mcp-port` (default `8766`),
+`--wake-url`, `--wake-token`, `--autostart`. Without `--with-mcp` nothing changes — each
+connection gets its own run, exactly as before.
+
 `--rows`/`--cols` are only the fallback: the client's `start` decides the real size. The
 defaults are small because Unity draws each cell 20 world units wide, and a large field
 falls outside the framing of the presentation cameras.
+
+---
+
+## 11. The supervision layer (`Servidor/agent/`, `agent/`)
+
+The engine plans well and re-plans never. Zones are drawn once, in
+`Simulation.__init__`, when nothing has been cut and area is a fair proxy for work.
+Later in a campaign the two come apart: a harvester can own a quarter of the map with
+three cells left on it while its neighbour still has forty. It drives home and parks,
+and the clock keeps running for everybody else. That is what the idle column in §6 is
+measuring, and no amount of better routing fixes it — it is a decision nobody was making.
+
+This layer is where that decision lives. An agent framework — OpenClaw, or anything that
+speaks MCP — watches the run and steers it **at the level of goals**. It never drives a
+machine, plans a route or picks a cell to cut.
+
+```bash
+python3 Servidor/server.py --with-mcp --autostart      # ws://8765 + MCP on http://8766/mcp
+python3 Servidor/server.py --with-mcp --wake-url http://localhost:18789/hooks/wake
+```
+
+### 11.1 What the engine gained
+
+Four commands, each reusing machinery that was already here:
+
+| Command | What it does |
+|---|---|
+| `rebalance()` | Redraws the zones over the crop **still standing**, seeded where the machines are now, and calls a harvester that had already parked back out |
+| `disable(id)` / `repair(id)` | Breaks a machine down where it stands: it stops working, becomes an obstacle, releases its cart and hands its zone to the others |
+| `prioritize(a, b)` | Brings the crop inside a rectangle to the front of every work plan |
+| `add_cart()` | One more cart out of the farm |
+
+`rebalance` is `partition_zones` again, with two changes. Seeds come from
+`anchored_seeds` (each machine's nearest remaining cell) instead of `farthest_point_seeds`
+— a split that ignored current positions would send the whole fleet across the field to
+swap places. And the round-robin growth now advances by **one unit of weight** rather than
+one cell, with `crop_only` weighing standing crop at 1 and cut ground at 0. Ground already
+cut is swept up on the way to the next standing cell instead of costing anybody a turn, so
+the zones come out balanced by *work* rather than by area. With the default `uniform`
+weight the loop is exactly what it was, which is why the opening partition is unchanged.
+
+`REQUEST_THRESHOLD` and `WAIT_WEIGHT` moved out of module scope into a `Policy` object the
+simulation, the harvesters and the auction all share, so retuning it reaches all three at
+once.
+
+### 11.2 Two bugs this uncovered
+
+Both were in `main` before any of this existed, and both are fixed:
+
+- **An orphaned unload request.** A cart that fills up or loses its dock calls
+  `release()` without telling the dispatcher. The `UnloadRequest` stays marked as served by
+  a cart that is never coming, never returns to `pending`, and the harvester waits out the
+  rest of the campaign with a full tank. `Dispatcher.sync()` now reopens those before each
+  auction. Measured over 200 runs (2 field sizes × 5 fleets × 20 seeds): **2 hung, now 0.**
+- **A bid that could not be placed.** `Dispatcher.bid` routed to the harvester's own cell.
+  A harvester whose tank fills up on a cell it cannot then cut is standing *on standing
+  crop*, which no cart may drive onto — so no cart could bid and the machine waited
+  forever. The bid now prices the drive to the berth from `GrainCart.station()`, which is
+  where the cart was actually going anyway.
+
+### 11.3 The tools
+
+Reading: `get_fleet_state` (crop left per machine, waiting time, open requests, rolling
+idle ratio, policy in force), `get_field_map` (the field as text, digits showing which
+harvester owns each standing cell), `explain_last_decision`, `list_recent_events`.
+
+Changing: `rebalance_zones`, `disable_machine`, `repair_machine`, `prioritize_region`,
+`set_policy`, `add_cart`, `announce`, `pause_run`, `resume_run`, `restart_run`.
+
+`announce` captions the field with one line in the operator's language; it rides down to
+Unity in the state as `narration`, so the reasoning is on screen with the thing it explains.
+
+**The protocol is not ours.** The tools are declared with the official MCP SDK, so a tool
+is a plain function whose docstring is the description the model reads and whose type
+hints are the input schema — the two things that must never drift apart are written once:
+
+```python
+@mcp.tool(annotations=BREAKS)
+@guarded(mutating=True)
+def disable_machine(harvester: str) -> dict:
+    """Break a harvester down where it stands: it stops working and becomes..."""
+```
+
+An earlier version carried its own `mcp.py` and `http.py` — 336 lines of JSON-RPC and
+hand-parsed HTTP. They worked, and OpenClaw talked to them, but reimplementing a protocol
+is surface a reviewer has to audit for no gain. The SDK's app is served by uvicorn **as a
+task on the bridge's own event loop**, not through `uvicorn.run()`: sharing the loop is
+what lets a tool call and the tick loop touch the same `Session` with no locks and no
+second copy of the world.
+
+### 11.4 The gate (`agent/policy.py`)
+
+NemoClaw pairs its agent with **OpenShell**, a runtime that decides what the model may
+actually execute. That runtime is in preview, so the same idea is implemented here, in the
+one place it can be audited: an allowlist, bounds-checked arguments, a budget of three
+world-changing calls per 60 ticks *or* 30 seconds, and a log of every call including the
+refused ones — which is exactly what `explain_last_decision` returns.
+
+The dual window matters: a paused or finished run stops advancing the tick, and a budget
+measured only in ticks would never refill. Three commands and the supervisor would be
+locked out of its own fleet for good.
+
+The guarantees in §8 are properties of the engine, and they stay properties of the engine
+because nothing outside it can reach past this gate. Verified by hammering the commands at
+random — 20 seeds, ~250 calls — and checking every invariant still holds.
+
+### 11.5 What wakes it (`agent/watcher.py`)
+
+OpenClaw's heartbeat runs on a clock measured in minutes; a campaign runs at half a second
+per tick, so a scheduled heartbeat would sleep through the whole harvest. The gateway also
+takes wakes on demand, which is the right shape: the simulation knows the moment something
+goes wrong and says so, through `POST /hooks/wake`.
+
+Four conditions, each debounced so a situation lasting two hundred ticks raises one event
+rather than two hundred: a harvester pinned with a full tank, the work gone lopsided, the
+fleet standing still, a machine down. They are phrased as facts, not instructions —
+deciding to do nothing is a valid answer and the skill says so.
+
+With no `--wake-url` the server never wakes anybody and answers only when asked. With a
+gateway that is down, `post_json` returns 0 and the campaign carries on: **the simulation
+never depends on the agent being there.**
+
+### 11.6 Running it
+
+Verified end to end on OpenClaw **2026.9.2**. Every step below was actually run.
+
+**1. OpenClaw needs Node ≥22.22.3**; Ubuntu ships 18. Without root, put both in
+`~/.local`:
+
+```bash
+curl -sL https://nodejs.org/dist/v24.20.0/node-v24.20.0-linux-x64.tar.xz | \
+  tar -xJ -C ~/.local/node --strip-components=1        # mkdir -p it first
+export PATH="$HOME/.local/node/bin:$HOME/.local/bin:$PATH"
+npm config set prefix ~/.local && npm install -g openclaw
+```
+
+**2. Configure.** Copy `agent/openclaw.example.json5` into
+`~/.openclaw/openclaw.json`, put the absolute path to `agent/skills` in
+`skills.load.extraDirs`, and generate a hook token. Then:
+
+```bash
+openclaw config validate      # Config valid: ~/.openclaw/openclaw.json
+openclaw skills list | grep farm-manager      # ✓ ready
+```
+
+Three things that will bite otherwise, all found the hard way:
+
+- **`gateway.mode` is mandatory.** Without it the gateway refuses to start
+  ("existing config is missing gateway.mode… treat this as suspicious").
+- **The skill cannot be symlinked into the workspace.** OpenClaw rejects it as a
+  `symlink-escape`. `skills.load.extraDirs` is the supported way to keep it
+  versioned in this repo.
+- **The two hooks disagree on the field name.** `/hooks/agent` runs a turn for
+  one named agent and reads `message`; `/hooks/wake` queues an event for the
+  main session and reads `text`. The watcher sends both, so `--wake-url` alone
+  picks the behaviour. `/hooks/agent` is the one you want here — `/hooks/wake`
+  would go to the default agent, not to `farm-manager`.
+
+**3. Start it.** `agent/run-demo.sh` brings up both processes, reads the hook
+token out of the config so they cannot drift apart, and stops both on Ctrl-C.
+By hand it is:
+
+```bash
+python3 Servidor/server.py --with-mcp --autostart \
+  --rows 16 --cols 22 --harvesters 4 --carts 2 \
+  --wake-url http://127.0.0.1:18789/hooks/agent --wake-token "$TOKEN"
+
+openclaw gateway
+openclaw mcp probe johndeere        # johndeere: 14 tools
+```
+
+**4. Talk to it**, or leave it alone and let the field wake it. The four that make a
+demo, in order:
+
+```bash
+A="openclaw agent --agent farm-manager --session-key harvest -m"
+$A "¿Cómo va la cosecha?"
+$A "Se descompuso la cosechadora H2. Reorganiza y avisa en pantalla."
+$A "Viene lluvia sobre las filas 1 a 4. Prioriza esa franja."
+$A "Explica qué has hecho hasta ahora y por qué."
+```
+
+Keep the same `--session-key` across all four so the agent remembers what it already did;
+the last one then answers from its own history rather than from the log.
+
+Tools carry MCP annotations (`readOnlyHint`, `destructiveHint`), so reading the
+fleet state does not prompt the operator for approval while changing it does.
+
+### 11.7 The two backends
+
+**Claude Pro.** `models.providers.anthropic.agentRuntime.id = "claude-cli"` routes model
+calls through the installed `claude` binary and its own login, so turns draw on the
+subscription instead of API credits. Confirmed in the gateway log:
+
+```
+[agent/cli-backend] cli turn: provider=claude-cli model=claude-opus-5
+```
+
+**Local, on a Jetson AGX Orin.** The first version of this installed Ollama on the Orin's
+host. That was the wrong call: the machine is shared, the installer left a service
+`enabled` at boot, it listened on `0.0.0.0:11434` with no authentication — handing the
+GPU to anyone on the tailnet — and it parked 21 GB of weights in `/usr/share/ollama`. All
+of that has been removed and the host is back to what it was.
+
+It now runs in a container, started only when it is wanted:
+
+```bash
+./agent/orin-model.sh start          # container up, GPU checked
+./agent/orin-model.sh pull qwen3:8b  # weights into a named volume
+./agent/orin-model.sh tunnel         # forward it to localhost:11435 here
+./agent/orin-model.sh stop           # gone; the volume keeps the models
+./agent/orin-model.sh purge          # volume and image gone too
+```
+
+Four properties, each deliberate on a machine somebody else also uses:
+
+- **Nothing on the host.** One container and one named volume, both prefixed `jd-`. The
+  team's own `home2-hri-ollama-*` containers and their model directory are untouched.
+- **Nothing at boot.** `--rm` and no restart policy. A reboot brings nothing back and
+  there is no service for anyone to discover.
+- **Not on the tailnet.** The port is published on the Orin's loopback only, so it is
+  reachable through an SSH tunnel and not otherwise. `curl http://<orin>:11434/api/version`
+  from another machine gets nothing.
+- **Removable in one command.** `purge` deletes the container, the volume and the image.
+
+Two things worth knowing before repeating this on a Jetson:
+
+- **JetPack 7 has no jetson-containers build.** `dustynv/ollama` stops at `r36.4.3`
+  (JetPack 6) and this board runs L4T **R39.2.1**. The official `ollama/ollama` image has
+  a native arm64 build and does detect the iGPU — it skips its own CUDA 12 libraries
+  (`compute capability not in compiled architectures`, the Orin is `cc=870`) and picks
+  the CUDA 13 ones:
+
+  ```
+  inference compute library=CUDA compute=8.7 name=CUDA0 description=Orin
+    type=iGPU driver=13.2 total="61.4 GiB"
+  ```
+
+  `--runtime nvidia` on its own is enough, which is what the machine's own compose files
+  use; `--gpus all` adds nothing on Tegra.
+
+- **Ollama sizes the context off total memory.** On 61 GiB of unified memory it picks
+  `default_num_ctx=262144` — a quarter-million-token KV cache for a prompt of a few
+  thousand. `OLLAMA_CONTEXT_LENGTH` is pinned to 16384 in the run script.
+
+### 11.8 The prompt is the bottleneck, and most of it is not ours
+
+A local model pays for the whole prompt on every call, and a tool call costs a second
+round trip, so one supervision decision reads the prompt twice. Measuring where those
+tokens come from was more useful than any model choice:
+
+| Part | Tokens | Share |
+|---|---|---|
+| The 14 MCP tool schemas | ~1,670 | 7% |
+| `SKILL.md` | ~1,050 | 4% |
+| **Everything OpenClaw injects** | **~22,100** | **89%** |
+| Total measured on the wire | 24,853 | |
+
+So the obvious lever — trimming the tool surface this repo exposes — is worth about a
+thousand tokens out of twenty-five thousand. The real weight is OpenClaw's own baseline:
+thirteen plugins' worth of built-in tools, and the catalogue of all 58 discovered skills
+injected so the agent knows what exists.
+
+Applied together, the prompt on the wire went from **24,853 tokens to 8,193** — a 67%
+cut, and reading it on the Orin dropped from 57 s to **5.7 s**. What moves it, in order:
+
+1. `plugins.deny` for what this agent never touches — browser, canvas, cua-computer,
+   file-transfer, geolocation, talk-voice, memory-core, xai. **Plugins loaded went from
+   13 to 5.** It also silences the `[memory] sync failed: No API key found for provider
+   "openai"` line that repeats through the gateway log.
+2. `skills.limits.maxSkillsInPrompt` / `maxSkillsPromptChars`, so 57 skill descriptions
+   the agent cannot use stop riding along.
+3. `mcp.servers.johndeere.toolFilter.include` with five tools instead of fourteen. The
+   smallest of the three, applied last.
+
+**Two of these are for the local backend only.** The five-tool filter drops
+`disable_machine` — the breakdown, which is the most visual moment of the demo — along
+with `explain_last_decision` and the pause/restart controls. And `thinkingDefault: "off"`
+exists to stop Qwen3 spending a minute reasoning; on Claude it just takes the reasoning
+away. Both stay out of the default config and go in only when running on the Orin.
+`plugins.deny` and `skills.limits` are safe either way and stay on.
+
+**What does not work:** `agents.entries.*.tools.profile: "minimal"`. It looks like
+exactly the right knob and it is a trap — it strips the MCP server from the agent
+entirely, and `tools.alsoAllow: ["mcp__johndeere__*"]` does not bring it back. Asked to
+read the fleet state under that setting the agent answered *"las herramientas MCP
+johndeere no están cargadas en esta sesión"* and reached the endpoint over plain HTTP
+instead. It got the right answer by the wrong road. The setting is left out.
+
+### 11.9 The remote control: Telegram
+
+The CLI and the Control UI both tie the presenter to a keyboard. With a chat channel
+linked, the operator walks the stage, types *"se descompuso H2"* on a phone, and the field
+reorganises on the screen behind them. It adds no information — it moves the controls.
+
+Nothing in `johndeere/` or `Servidor/` changes. `farm-manager` is already the gateway's
+default agent with its fourteen MCP tools; the channel is one more surface messages
+arrive on.
+
+**Telegram is the one to use**, and it needs no plugin — it ships inside OpenClaw
+(`dist/telegram`). Create the bot from inside Telegram itself: message `@BotFather`,
+send `/newbot`, give it a name and a username ending in `bot`, and it hands back a token.
+
+```json5
+channels: {
+  telegram: {
+    enabled: true,
+    botToken: "<from BotFather>",
+    dmPolicy: "pairing",
+    groupPolicy: "disabled",
+  },
+},
+bindings: [
+  { type: "route", agentId: "farm-manager", match: { channel: "telegram" } },
+],
+```
+
+`dmPolicy: "pairing"` rather than a raw allowlist because Telegram identifies senders by
+numeric user id, which nobody knows by heart. The first message raises a request, one
+`openclaw pairing approve telegram <CODE>` pins that sender for good, and everybody else
+is dropped — which matters, because this agent can break machines and restart the
+campaign. `groupPolicy: "disabled"` closes the other way in.
+
+**Why not WhatsApp.** It was tried first and removed. Its channel links through Baileys —
+WhatsApp Web automation, not the official business API — so it needs a real phone number,
+a QR scan, and it puts the linked account at risk of a ban. A dedicated number means a
+physical prepaid SIM; virtual numbers are mostly blocked by WhatsApp at registration. A
+Telegram bot has no phone number at all, its token is revocable from `@BotFather` in
+seconds, and the operator's personal account is never part of the setup.
+
+**The field never texts first.** The watcher POSTs to `/hooks/agent` with no delivery
+fields, so the turns it wakes run headless and nothing arrives unprompted. The channel
+carries the operator's orders and the replies to them, and that is all. Turning that
+around later is a config change, not a code one: `hooks.mappings` takes `channel`, `to`
+and `deliver`.
+
+`run-demo.sh` prints the channel's status in its banner, so a channel that came down
+shows up before you are on stage rather than during.
+
+### 11.10 What the local backend actually costs
+
+Measured on the Orin, through the container, with the cut prompt:
+
+| | Before the cuts | After |
+|---|---|---|
+| Prompt on the wire | 24,853 tokens | **8,193** |
+| Reading it | 57 s (433 tok/s, 30B) | **5.7 s** (1,426 tok/s, 4B) |
+| Generating | 15 tok/s | **29 tok/s** |
+
+Reading the prompt stopped being the problem. What replaced it: Qwen3 reasons before
+answering, and a single "how is the harvest going" produced **1,738 tokens** of thinking
+at 29 tok/s — a minute of generation for one sentence of output. `thinkingDefault: "off"`
+on the agent entry is the knob for it.
+
+**Not yet working end to end.** An `openclaw agent --model orin/qwen3:4b` turn does not
+reach the container: the gateway reports `LLM request failed: network connection error`
+and Ollama logs no request, while a plain `curl` to the very same tunnelled endpoint
+answers correctly. The tunnel, the container and the model are all verified good in
+isolation, so the fault is in how OpenClaw reaches the provider, and it is unfinished.
+
+Which does not change the recommendation. The Claude Pro backend is the one to demo:
+verified end to end, ~15 s per decision, and it keeps up with a field being harvested in
+front of an audience. The Orin is the comparison exhibit, and the numbers above are the
+interesting part of it either way.
+
+### 11.11 It runs unattended
+
+Left alone for three minutes on a 16×22 field with 4 harvesters and 2 carts, no
+operator touching anything:
+
+```
+tick 43  [harvester_waiting] H0 (12 ticks) has a full tank and no cart alongside
+   t 47  get_fleet_state
+   t 53  add_cart -> C2
+   t 54  announce "H0 and H2 both full and stopped with both carts already busy"
+   t 68  add_cart -> C3
+tick 77  [work_lopsided] H1 has run out of work while H0 still has 56 cells
+   t 81  get_fleet_state
+   t 85  rebalance_zones -> 4 zones
+   t 86  announce "H1 se quedó sin trabajo con 146 celdas en pie…"
+```
+
+Plans went from 56/0/51/53 to 30/33/32/35 and the idle ratio fell from 0.54 to
+0.31. The supervisor read the state before every change, made one change per
+wake-up, and said why — which is exactly what the skill asks for, and it is
+`explain_last_decision` that produced the trace above.
+
+### 11.12 Does it actually pay?
+
+20 held-out seeds on a 16×22 field, comparing the plain engine against the same engine
+rebalancing when a machine runs out of work while another still has a backlog of more
+than 25 cells, at most once every 60 ticks. Both rows of every pair run the fixed engine,
+so the deadlock fixes of §11.2 are not what is being measured here:
+
+| Fleet | Ticks | Idle | L/unit |
+|---|---|---|---|
+| 2H/1C | 455 → 465 (+2%) | 589 → 577 (−2%) | 1.73 → 1.83 (+6%) |
+| 3H/2C | 294 → 277 (−6%) | 587 → 495 (−16%) | 2.00 → 2.03 (+2%) |
+| 4H/2C | 288 → 248 (**−14%**) | 809 → 581 (**−28%**) | 2.15 → 2.14 (−1%) |
+| 5H/3C | 211 → 217 (+3%) | 767 → 729 (−5%) | 2.15 → 2.36 (+10%) |
+
+Read honestly: it pays where the zones can actually go lopsided, and costs a little
+where they cannot. With two harvesters there is not enough imbalance to be worth a drive;
+with five on this field the logistics saturate before the cutting does, and calling a
+parked machine back out spends fuel to save nothing. **Fuel generally goes up while time
+goes down** — a machine that would have parked is now driving.
+
+Which is the argument for the layer rather than against it. A fixed rule cannot tell
+2H/1C from 4H/2C. The supervisor reads the fleet, the idle ratio and the spread before
+deciding, and "do nothing" is an answer it is explicitly told to prefer.

@@ -16,6 +16,8 @@ class FleetMetrics:
     harvested: int = 0
     delivered: int = 0
     in_transit: int = 0
+    #: Grain aboard machines that broke down: harvested, never delivered.
+    stranded: int = 0
     distance: int = 0
     fuel: float = 0.0
     idle_ticks: int = 0

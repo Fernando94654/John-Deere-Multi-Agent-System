@@ -1,0 +1,147 @@
+// Merge this into ~/.openclaw/openclaw.json (the file OpenClaw writes is plain
+// JSON; JSON5 is accepted, comments and all). Every key here was checked
+// against `openclaw config schema` on OpenClaw 2026.9.2 and validated with
+// `openclaw config validate`.
+//
+// Two model backends are shown. The tools, the skill and the simulation are
+// identical either way — which is the point: the same supervisor runs on a
+// small model at the edge and on a frontier model, and the difference shows up
+// in the decisions, not in the plumbing.
+{
+  // The gateway will refuse to start without an explicit mode.
+  gateway: {
+    mode: "local",
+    port: 18789,
+    bind: "loopback",
+  },
+
+  // The simulation's tool surface. `server.py --with-mcp` puts it here.
+  mcp: {
+    servers: {
+      johndeere: {
+        url: "http://127.0.0.1:8766/mcp",
+        transport: "streamable-http",
+        enabled: true,
+        connectionTimeoutMs: 5000,
+        requestTimeoutMs: 20000,
+        // No toolFilter on purpose. Trimming the surface saves ~1,000 prompt
+        // tokens, but it takes `disable_machine` (the breakdown) and
+        // `explain_last_decision` (the audit trail) with it — the two the demo
+        // script and SKILL.md both lean on. Add one only for a small local
+        // model, and check the skill still matches what you left in.
+      },
+    },
+  },
+
+  // Prompt budget. A local model pays for the prompt twice per decision, so
+  // what OpenClaw injects by default matters more than anything this repo adds.
+  // Do NOT add `agents.entries.*.tools.profile: "minimal"` here: it strips the
+  // MCP server from the agent, and `alsoAllow: ["mcp__johndeere__*"]` does not
+  // bring it back. The agent then has no tools at all.
+  plugins: {
+    deny: [
+      "browser", "canvas", "cua-computer", "file-transfer",
+      "geolocation", "talk-voice", "memory-core", "xai",
+    ],
+  },
+
+  // The skill stays versioned in this repo rather than copied into the
+  // workspace. A symlink is refused ("symlink-escape"); an extra root is not.
+  skills: {
+    load: {
+      extraDirs: ["/absolute/path/to/John-Deere-Multi-Agent-System/agent/skills"],
+    },
+    // The catalogue of every discovered skill is injected so the agent knows
+    // what exists. This one has a single skill; the other 57 descriptions are
+    // dead weight in every prompt.
+    limits: { maxSkillsInPrompt: 2, maxSkillsPromptChars: 6000 },
+  },
+
+  models: {
+    mode: "merge",
+    providers: {
+      // --- A: Claude Pro, through the Claude Code CLI --------------------
+      // `agentRuntime.id: "claude-cli"` routes model calls through the
+      // installed `claude` binary and its own login, so the turns draw on the
+      // subscription instead of API credits. Confirmed in the gateway log as
+      // `[agent/cli-backend] cli turn: provider=claude-cli model=claude-opus-5`.
+      anthropic: {
+        agentRuntime: { id: "claude-cli" },
+      },
+
+      // --- B: local, on a Jetson AGX Orin -------------------------------
+      // Nothing is installed on the Orin: `agent/orin-model.sh` runs Ollama in
+      // a container and forwards it here, so the address is this machine's
+      // loopback, not the Orin's tailnet IP. See README §11.7.
+      // `models` takes objects, not strings, and `apiKey` is required even
+      // though Ollama ignores it — without one the turn fails with
+      // "No API key found for provider".
+      orin: {
+        api: "ollama",
+        baseUrl: "http://127.0.0.1:11435",
+        apiKey: "ollama",
+        models: [
+          { id: "qwen3:8b", name: "Qwen3 8B (Orin)", contextWindow: 16384 },
+          { id: "qwen3:4b", name: "Qwen3 4B (Orin)", contextWindow: 16384 },
+        ],
+      },
+    },
+  },
+
+  agents: {
+    entries: {
+      "farm-manager": {
+        name: "Farm manager",
+        description: "Supervises the John Deere multi-agent harvest simulation",
+        model: "anthropic/claude-opus-5",
+        // model: "orin/nemotron-nano-9b",   // backend B
+        skills: ["farm-manager"],
+        // No `heartbeat` block: its cadence is minutes and a campaign runs at
+        // half a second per tick. The simulation wakes this agent by event
+        // instead, through the hook below.
+      },
+    },
+  },
+
+  // A chat channel turns the supervisor into a remote control: the operator
+  // walks the stage, types "se descompuso H2" from a phone, and the field
+  // reorganises on the screen behind them.
+  //
+  // Telegram needs no plugin — it ships inside OpenClaw. Create the bot from
+  // inside Telegram: message @BotFather, send /newbot, and it hands back the
+  // token below. The bot has no phone number of its own, and the token is
+  // revocable from @BotFather in seconds.
+  channels: {
+    telegram: {
+      enabled: true,
+      botToken: "<from @BotFather>",
+      // Pairing rather than a raw allowlist: Telegram identifies senders by
+      // numeric user id, which nobody knows by heart. The first message raises
+      // a request, one `openclaw pairing approve telegram <CODE>` pins that
+      // sender, and everyone else is dropped — which matters, because this
+      // agent can break machines and restart the campaign.
+      dmPolicy: "pairing",
+      groupPolicy: "disabled",
+    },
+  },
+
+  // farm-manager is already the default agent, so this is belt and braces —
+  // it stops a second agent added later from quietly taking the traffic.
+  bindings: [
+    { type: "route", agentId: "farm-manager", match: { channel: "telegram" } },
+  ],
+
+  // What the simulation POSTs its events to. `/hooks/agent` runs one turn for
+  // a named agent and reads `message`; `/hooks/wake` queues an event for the
+  // main session and reads `text`. The watcher sends both fields, so either
+  // endpoint works and the --wake-url alone decides which.
+  hooks: {
+    enabled: true,
+    path: "/hooks",
+    token: "generate-your-own-and-pass-it-as---wake-token",
+    allowedAgentIds: ["farm-manager"],
+    allowRequestSessionKey: true,
+    allowedSessionKeyPrefixes: ["harvest"],
+    defaultSessionKey: "harvest",
+  },
+}

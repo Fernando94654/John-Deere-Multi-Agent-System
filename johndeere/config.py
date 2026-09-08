@@ -29,6 +29,25 @@ WAIT_WEIGHT = 1.5  # how much a harvester's wait discounts an auction bid
 
 
 @dataclass
+class Policy:
+    """The coordination knobs a supervisor may retune while a run is going.
+
+    They start on the constants above, so a simulation built without touching
+    the policy behaves exactly as it did before this existed.
+    """
+
+    request_threshold: float = REQUEST_THRESHOLD
+    wait_weight: float = WAIT_WEIGHT
+
+    def validate(self) -> None:
+        """Raise `ValueError` on settings that would stall the fleet."""
+        if not 0.05 <= self.request_threshold <= 1.0:
+            raise ValueError("request_threshold must lie between 0.05 and 1.0")
+        if not 0.0 <= self.wait_weight <= 10.0:
+            raise ValueError("wait_weight must lie between 0 and 10")
+
+
+@dataclass
 class SimulationConfig:
     """Parameters of a run. Everything not listed here is hardcoded above."""
 
