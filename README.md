@@ -51,8 +51,9 @@ Servidor/
     http.py                   just enough HTTP to carry it
 agent/
   skills/farm-manager/        the OpenClaw skill: doctrine, not capability
-  openclaw.example.json5      MCP registration and the two model backends
+  openclaw.example.json5      MCP registration, model backends, chat channel
   run-demo.sh                 brings up the gateway and the simulation together
+  orin-model.sh               runs the local model in a container on the Jetson
 ```
 
 Dependencies run one way only:
@@ -816,7 +817,57 @@ read the fleet state under that setting the agent answered *"las herramientas MC
 johndeere no están cargadas en esta sesión"* and reached the endpoint over plain HTTP
 instead. It got the right answer by the wrong road. The setting is left out.
 
-### 11.9 What the local backend actually costs
+### 11.9 The remote control: Telegram
+
+The CLI and the Control UI both tie the presenter to a keyboard. With a chat channel
+linked, the operator walks the stage, types *"se descompuso H2"* on a phone, and the field
+reorganises on the screen behind them. It adds no information — it moves the controls.
+
+Nothing in `johndeere/` or `Servidor/` changes. `farm-manager` is already the gateway's
+default agent with its fourteen MCP tools; the channel is one more surface messages
+arrive on.
+
+**Telegram is the one to use**, and it needs no plugin — it ships inside OpenClaw
+(`dist/telegram`). Create the bot from inside Telegram itself: message `@BotFather`,
+send `/newbot`, give it a name and a username ending in `bot`, and it hands back a token.
+
+```json5
+channels: {
+  telegram: {
+    enabled: true,
+    botToken: "<from BotFather>",
+    dmPolicy: "pairing",
+    groupPolicy: "disabled",
+  },
+},
+bindings: [
+  { type: "route", agentId: "farm-manager", match: { channel: "telegram" } },
+],
+```
+
+`dmPolicy: "pairing"` rather than a raw allowlist because Telegram identifies senders by
+numeric user id, which nobody knows by heart. The first message raises a request, one
+`openclaw pairing approve telegram <CODE>` pins that sender for good, and everybody else
+is dropped — which matters, because this agent can break machines and restart the
+campaign. `groupPolicy: "disabled"` closes the other way in.
+
+**Why not WhatsApp.** It was tried first and removed. Its channel links through Baileys —
+WhatsApp Web automation, not the official business API — so it needs a real phone number,
+a QR scan, and it puts the linked account at risk of a ban. A dedicated number means a
+physical prepaid SIM; virtual numbers are mostly blocked by WhatsApp at registration. A
+Telegram bot has no phone number at all, its token is revocable from `@BotFather` in
+seconds, and the operator's personal account is never part of the setup.
+
+**The field never texts first.** The watcher POSTs to `/hooks/agent` with no delivery
+fields, so the turns it wakes run headless and nothing arrives unprompted. The channel
+carries the operator's orders and the replies to them, and that is all. Turning that
+around later is a config change, not a code one: `hooks.mappings` takes `channel`, `to`
+and `deliver`.
+
+`run-demo.sh` prints the channel's status in its banner, so a channel that came down
+shows up before you are on stage rather than during.
+
+### 11.10 What the local backend actually costs
 
 Measured on the Orin, through the container, with the cut prompt:
 
@@ -842,7 +893,7 @@ verified end to end, ~15 s per decision, and it keeps up with a field being harv
 front of an audience. The Orin is the comparison exhibit, and the numbers above are the
 interesting part of it either way.
 
-### 11.10 It runs unattended
+### 11.11 It runs unattended
 
 Left alone for three minutes on a 16×22 field with 4 harvesters and 2 carts, no
 operator touching anything:
@@ -864,7 +915,7 @@ Plans went from 56/0/51/53 to 30/33/32/35 and the idle ratio fell from 0.54 to
 wake-up, and said why — which is exactly what the skill asks for, and it is
 `explain_last_decision` that produced the trace above.
 
-### 11.11 Does it actually pay?
+### 11.12 Does it actually pay?
 
 20 held-out seeds on a 16×22 field, comparing the plain engine against the same engine
 rebalancing when a machine runs out of work while another still has a backlog of more

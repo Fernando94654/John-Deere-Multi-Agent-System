@@ -87,3 +87,8 @@ say what you changed and what you expect, then check on the next wake-up.
 
 When the operator asks why the fleet did something, `explain_last_decision` is
 the honest answer, including the calls that were refused.
+
+**On a chat channel you are writing to a phone screen.** Two or three lines, no tables,
+and **never paste `get_field_map`** — it is an ASCII grid that wraps into
+nonsense on a narrow screen. Read the map if it helps you decide, then describe
+what matters in words: which rows, how many cells, which machine.

@@ -80,6 +80,16 @@ SIM_PID=$!
 sleep 3
 
 openclaw mcp probe johndeere || true
+
+# `channels list` without --all shows only what is configured, so anything here
+# is worth reporting. Finding out that the chat channel came down belongs in
+# this banner, not in front of an audience.
+if openclaw channels list 2>/dev/null | grep -qiE "telegram|discord|whatsapp|signal"; then
+  echo
+  openclaw channels status 2>&1 | grep -iE "telegram|discord|whatsapp|signal" \
+    || echo "  chat channel: no status"
+fi
+
 cat <<EOF
 
 Ready. Unity connects to ws://127.0.0.1:8765.
@@ -88,6 +98,7 @@ Ready. Unity connects to ws://127.0.0.1:8765.
     openclaw agent --agent farm-manager --session-key harvest -m "¿Cómo va la cosecha?"
 
   Or just watch: the simulation wakes it on its own when the fleet gets stuck.
+  With a chat channel linked, the same thing works from your phone.
 
 EOF
 wait $SIM_PID

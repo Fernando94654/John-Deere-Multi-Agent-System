@@ -106,6 +106,34 @@
     },
   },
 
+  // A chat channel turns the supervisor into a remote control: the operator
+  // walks the stage, types "se descompuso H2" from a phone, and the field
+  // reorganises on the screen behind them.
+  //
+  // Telegram needs no plugin — it ships inside OpenClaw. Create the bot from
+  // inside Telegram: message @BotFather, send /newbot, and it hands back the
+  // token below. The bot has no phone number of its own, and the token is
+  // revocable from @BotFather in seconds.
+  channels: {
+    telegram: {
+      enabled: true,
+      botToken: "<from @BotFather>",
+      // Pairing rather than a raw allowlist: Telegram identifies senders by
+      // numeric user id, which nobody knows by heart. The first message raises
+      // a request, one `openclaw pairing approve telegram <CODE>` pins that
+      // sender, and everyone else is dropped — which matters, because this
+      // agent can break machines and restart the campaign.
+      dmPolicy: "pairing",
+      groupPolicy: "disabled",
+    },
+  },
+
+  // farm-manager is already the default agent, so this is belt and braces —
+  // it stops a second agent added later from quietly taking the traffic.
+  bindings: [
+    { type: "route", agentId: "farm-manager", match: { channel: "telegram" } },
+  ],
+
   // What the simulation POSTs its events to. `/hooks/agent` runs one turn for
   // a named agent and reads `message`; `/hooks/wake` queues an event for the
   // main session and reads `text`. The watcher sends both fields, so either
