@@ -73,7 +73,9 @@ class GrainCart(Agent):
         """
         return self.position == harvester.left_cell
 
-    def station(self, field: Field, harvester: Harvester) -> Optional[Cell]:
+    def station(
+        self, field: Field, harvester: Harvester, blocked: tuple[Cell, ...] = ()
+    ) -> Optional[Cell]:
         """Where this cart should be to serve `harvester` right now.
 
         Normally the cell off the harvester's left side. When that one is a rock
@@ -84,11 +86,15 @@ class GrainCart(Agent):
         # them over cut ground, not by straight-line distance: the cell in front
         # of the harvester can be a stone's throw away and still have no route
         # to it, while the trail it just cut always leads somewhere.
+        # `blocked` holds cells nothing can enter, such as a machine that broke down.
         reach = bfs_distances(
-            field, self.position, avoid_crop=True, blocked=(harvester.position,)
+            field,
+            self.position,
+            avoid_crop=True,
+            blocked=(harvester.position, *blocked),
         )
         dock = harvester.left_cell
-        if dock in reach or self.position == dock:
+        if dock not in blocked and (dock in reach or self.position == dock):
             return dock
         # The left-hand side is standing crop, a rock or off the field. Pull up
         # on any cut ground beside the harvester instead: it will turn on the
@@ -96,7 +102,7 @@ class GrainCart(Agent):
         berths = [
             cell
             for cell in field.neighbors(harvester.position, avoid_crop=True)
-            if cell in reach
+            if cell in reach and cell not in blocked
         ]
         if not berths:
             return None
@@ -109,7 +115,7 @@ class GrainCart(Agent):
         if self.docked(harvester):
             self.follow(None)
             return
-        goal = self.station(field, harvester)
+        goal = self.station(field, harvester, blocked)
         if goal is None:
             self.follow(None)
         elif not self.route or self.route[-1] != goal:

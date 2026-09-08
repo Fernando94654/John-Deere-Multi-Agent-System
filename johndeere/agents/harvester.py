@@ -143,7 +143,8 @@ class Harvester(Agent):
         if target is None:
             # Nothing left to cut: drive home, carrying whatever is still aboard.
             self.state = HarvesterState.RETURNING
-            if self.position == field.farm:
+            if self.position == field.farm and self.load == 0:
+                # Only done once empty; a part load stays RETURNING to be credited.
                 self.state = HarvesterState.DONE
                 self.follow(None)
             elif not self.route or self.route[-1] != field.farm:

@@ -84,7 +84,12 @@ class Dispatcher:
         return reopened
 
     def bid(
-        self, field: Field, cart: "GrainCart", harvester: "Harvester", tick: int
+        self,
+        field: Field,
+        cart: "GrainCart",
+        harvester: "Harvester",
+        tick: int,
+        blocked: tuple = (),
     ) -> Optional[float]:
         """What it costs this cart to serve this harvester; `None` if it cannot.
 
@@ -100,10 +105,10 @@ class Dispatcher:
         crop — routing to it would fail and leave the machine waiting for a cart
         that no rule allows anyone to send.
         """
-        dock = cart.station(field, harvester)
+        dock = cart.station(field, harvester, blocked)
         if dock is None:
             return None
-        route = a_star(field, cart.position, dock, avoid_crop=True)
+        route = a_star(field, cart.position, dock, blocked, avoid_crop=True)
         if route is None:
             return None
         shortfall = max(0, harvester.load - cart.free_capacity)
@@ -116,6 +121,7 @@ class Dispatcher:
         harvesters: dict[int, "Harvester"],
         carts: list["GrainCart"],
         tick: int,
+        blocked: tuple = (),
     ) -> None:
         """Assign free carts to open requests, cheapest bid first."""
         open_requests = self.pending
@@ -131,7 +137,7 @@ class Dispatcher:
             bids = [
                 (bid, cart.id, cart)
                 for cart in available
-                if (bid := self.bid(field, cart, harvester, tick)) is not None
+                if (bid := self.bid(field, cart, harvester, tick, blocked)) is not None
             ]
             if not bids:
                 continue

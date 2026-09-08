@@ -8,13 +8,12 @@ has broken down. It never drives a machine.
     tools.py     what the supervisor may ask and may change
     policy.py    the gate every command passes through, and the audit trail
     watcher.py   what wakes the agent when the fleet gets into trouble
-    mcp.py       the MCP wire protocol, JSON-RPC over one HTTP endpoint
-    http.py      just enough HTTP to carry it
+
+The protocol itself is the official MCP SDK's; only the tools are ours.
 """
 
-from .mcp import McpEndpoint, Tool
 from .policy import Guard
-from .tools import build_tools
+from .tools import build_server
 from .watcher import Watcher
 
-__all__ = ["McpEndpoint", "Tool", "Guard", "build_tools", "Watcher"]
+__all__ = ["Guard", "build_server", "Watcher"]

@@ -47,8 +47,6 @@ Servidor/
     tools.py                  what the supervisor may read and change
     policy.py                 the gate every command passes, and the audit trail
     watcher.py                what wakes the agent when the fleet gets stuck
-    mcp.py                    MCP over JSON-RPC
-    http.py                   just enough HTTP to carry it
 agent/
   skills/farm-manager/        the OpenClaw skill: doctrine, not capability
   openclaw.example.json5      MCP registration, model backends, chat channel
@@ -617,6 +615,24 @@ Changing: `rebalance_zones`, `disable_machine`, `repair_machine`, `prioritize_re
 
 `announce` captions the field with one line in the operator's language; it rides down to
 Unity in the state as `narration`, so the reasoning is on screen with the thing it explains.
+
+**The protocol is not ours.** The tools are declared with the official MCP SDK, so a tool
+is a plain function whose docstring is the description the model reads and whose type
+hints are the input schema — the two things that must never drift apart are written once:
+
+```python
+@mcp.tool(annotations=BREAKS)
+@guarded(mutating=True)
+def disable_machine(harvester: str) -> dict:
+    """Break a harvester down where it stands: it stops working and becomes..."""
+```
+
+An earlier version carried its own `mcp.py` and `http.py` — 336 lines of JSON-RPC and
+hand-parsed HTTP. They worked, and OpenClaw talked to them, but reimplementing a protocol
+is surface a reviewer has to audit for no gain. The SDK's app is served by uvicorn **as a
+task on the bridge's own event loop**, not through `uvicorn.run()`: sharing the loop is
+what lets a tool call and the tick loop touch the same `Session` with no locks and no
+second copy of the world.
 
 ### 11.4 The gate (`agent/policy.py`)
 

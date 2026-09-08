@@ -1,4 +1,7 @@
-matplotlib>=3.8
-websockets>=12
+matplotlib>=3.8      # frontends/visual.py, the 2D animation
+websockets>=12       # Servidor/server.py, the Unity bridge
+mcp>=2.2             # Servidor/agent/, the supervision tool surface
+uvicorn>=0.30        # serves the MCP app on the bridge's own event loop
 
-# The engine in johndeere/ and the console frontend are stdlib-only.
+# The engine in johndeere/ and the console frontend are stdlib-only, and stay
+# that way: every dependency above belongs to a frontend or to the bridge.

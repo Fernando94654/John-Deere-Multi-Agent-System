@@ -14,13 +14,11 @@ from typing import Callable, Iterable, Optional
 
 from ..world.field import Field
 from ..world.grid import Cell
-from .pathfinding import bfs_distances
+from .pathfinding import bfs_distances, manhattan
 
 Zone = set[Cell]
 
-#: How much work a cell is worth while zones are being balanced. The initial
-#: partition weighs every cell the same; a mid-campaign one weighs only the
-#: crop that is still standing, because bare ground is no longer work.
+#: What a cell is worth when balancing: every cell, or only standing crop.
 Weight = Callable[[Cell], int]
 
 
@@ -170,9 +168,7 @@ def partition_zones(
     while growing:
         growing = False
         for index, frontier in enumerate(frontiers):
-            # A round ends when the zone has gained one unit of work. Ground
-            # already cut is worth nothing, so it is swept up on the way to the
-            # next standing cell instead of costing anybody a turn.
+            # A round ends on one unit of work, so cut ground costs nobody a turn.
             gained = 0
             while frontier and gained == 0:
                 cell = frontier[0]
@@ -207,17 +203,38 @@ def anchored_seeds(
     """
     pool = set(cells)
     seeds: list[Cell] = []
+    taken: list[Cell] = []
+
+    def far_enough(cell: Cell) -> bool:
+        """True if this seed leaves room for the ones already chosen to grow.
+
+        Machines that share a cell — which every machine does at the farm, and
+        which `disable` and `repair` therefore hit on their internal rebalance —
+        would otherwise take that cell and its neighbours as seeds. The corner
+        one is then walled in by the others before growth starts, keeps its
+        single cell for the whole campaign, and its harvester stands idle with
+        an empty plan. Checking that a seed can grow *when it is chosen* is not
+        enough: the wall goes up later, when the next seed takes its last free
+        neighbour. Non-adjacency is the condition that actually holds, and
+        Manhattan distance is a safe test for it because the driving distance
+        is never shorter.
+        """
+        return all(manhattan(cell, other) >= 2 for other in taken)
+
     for anchor in anchors:
         if not pool:
             break
         distances = bfs_distances(field, anchor)
-        within_reach = [cell for cell in pool if cell in distances]
-        seed = (
-            min(within_reach, key=lambda c: (distances[c], c))
-            if within_reach
-            else min(pool)
+        within_reach = sorted(
+            (cell for cell in pool if cell in distances),
+            key=lambda c: (distances[c], c),
+        )
+        seed = next(
+            (cell for cell in within_reach if far_enough(cell)),
+            within_reach[0] if within_reach else min(pool),
         )
         seeds.append(seed)
+        taken.append(seed)
         pool.discard(seed)
     return seeds
 

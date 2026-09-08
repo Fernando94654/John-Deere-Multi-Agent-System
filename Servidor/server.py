@@ -31,6 +31,7 @@ import os
 import random
 import sys
 from typing import Optional
+import uvicorn
 import websockets
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,15 +40,11 @@ from johndeere.config import HARVESTER_TANK, REQUEST_THRESHOLD, SimulationConfig
 from johndeere.simulation import Simulation
 from johndeere.world.grid import OBSTACLE
 
-from agent import Guard, McpEndpoint, Watcher, build_tools
-from agent.http import serve_http
+from agent import Guard, Watcher, build_server
 
 MIN_SIDE = 6
 
-#: Reachable crop each harvester needs for the logistics to appear at all. Below
-#: its request threshold a harvester never calls for a cart, so on a field this
-#: thin the carts sit at the farm the whole campaign and the harvesters carry
-#: their own grain home — every rule working correctly, and nothing to look at.
+#: Crop each harvester needs before it ever calls a cart, and the carts appear.
 MIN_CROP_PER_HARVESTER = round(REQUEST_THRESHOLD * HARVESTER_TANK)
 
 
@@ -127,9 +124,7 @@ def build_state(sim: Simulation, snapshot, obstacles: list[dict], delay: float) 
         "crop": {
             "cells": flatten_crop(sim),
         },
-        # Which harvester owns each cell, or -1. Flat and row-major for the same
-        # reason as the crop layer, and it is what lets Unity tint the ground:
-        # when the supervisor redraws the zones, the colours move on screen.
+        # Owner per cell, or -1. Flat like the crop layer; Unity tints the ground with it.
         "zones": {
             "cells": sim.zone_map(),
         },
@@ -203,8 +198,7 @@ class Session:
         self.running = asyncio.Event()
         self.rebuild_pending = False
 
-        # Publishers wait on this; the driver swaps it out on every new state,
-        # so a state is never missed and never sent twice.
+        # Swapped out on every new state, so none is missed or sent twice.
         self._changed = asyncio.Event()
 
     # --- commands ---------------------------------------------------------
@@ -247,8 +241,7 @@ class Session:
 
         self.rows, self.cols = rows, cols
 
-        # The rebuild happens in the driver task, so a run is never swapped out
-        # from under a half-sent state.
+        # The driver owns the rebuild, so no run is swapped out mid-send.
         self.rebuild_pending = True
         self.running.set()
 
@@ -325,8 +318,7 @@ def apply_command(session: Session, message: dict) -> None:
     command = message.get("command", "start")
 
     if command == "start":
-        # Also the fallback for a message with no command at all, which is why
-        # it joins the running campaign rather than replacing it.
+        # Also the fallback for a message with no command, hence idempotent.
         session.start(
             int(message.get("rows", session.rows)),
             int(message.get("columns", session.cols)),
@@ -372,12 +364,22 @@ async def read_commands(websocket, session: Session) -> None:
 # Driving: one tick at a time
 # --------------------------------------------------------------------------
 
+#: Wake calls in flight, held so the loop cannot collect them early.
+_wakes: set[asyncio.Task] = set()
+
+
+def _wake_done(task: asyncio.Task) -> None:
+    """Drop a finished wake, and say so if it failed rather than swallowing it."""
+    _wakes.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        print(f"Waking the supervisor failed: {task.exception()}")
+
+
 async def drive(session: Session) -> None:
     """Advance the run and build each new state. The only writer of the world."""
     while True:
         if not session.running.is_set():
-            # Re-send the whole last state rather than a bare status message:
-            # the Unity client drops anything missing the world fields.
+            # A whole state, not a bare status: Unity drops anything missing the world.
             if session.last_state is not None:
                 session.notify("paused")
             await session.running.wait()
@@ -387,15 +389,12 @@ async def drive(session: Session) -> None:
             session.rebuild()
 
         if session.sim is None:
-            # The very first build was refused, so there is no world to drive.
-            # Wait for a start that the server will accept rather than crash
-            # the only task that moves the campaign forward.
+            # The first build was refused: wait for a good start rather than crash.
             session.running.clear()
             continue
 
         if session.finished:
-            # Keep republishing the final state so the field stays on screen
-            # while the presenter talks.
+            # Keep republishing so the finished field stays on screen.
             if session.last_state is None:
                 snapshot = session.sim.step()
                 session.last_state = build_state(
@@ -413,8 +412,10 @@ async def drive(session: Session) -> None:
             if events:
                 for event in events:
                     print(f"  tick {event.tick}: [{event.kind}] {event.detail}")
-                # Waking the agent must never hold up the tick loop.
-                asyncio.create_task(session.watcher.wake(events, session.sim))
+                # Held until done: a bare task can be collected mid-flight, errors and all.
+                task = asyncio.create_task(session.watcher.wake(events, session.sim))
+                _wakes.add(task)
+                task.add_done_callback(_wake_done)
 
         await asyncio.sleep(session.args.delay)
 
@@ -479,8 +480,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Serves the multi-agent simulation to Unity over WebSocket."
     )
-    # Unity draws each cell 20 world units wide, so the engine's default field
-    # falls outside the framing of the presentation cameras. These fit onscreen.
+    # Unity draws 20 world units per cell, so these fit the presentation cameras.
     parser.add_argument("--rows", type=int, default=10)
     parser.add_argument("--cols", type=int, default=12)
     parser.add_argument("--harvesters", type=int, default=2)
@@ -527,12 +527,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 async def main() -> None:
     args = parse_args()
 
-    # Fail here rather than inside a connection handler, where the traceback
-    # would reach Unity as an unexplained disconnect.
+    # Fail here, not in a handler where the traceback reaches Unity as a disconnect.
     build_config(args, args.rows, args.cols, args.seed).validate()
 
     shared: Optional[Session] = None
-    mcp_server = None
+    mcp_task = None
     if args.with_mcp:
         shared = Session(
             args,
@@ -543,10 +542,14 @@ async def main() -> None:
                 session_key=args.wake_session,
             ),
         )
-        endpoint = McpEndpoint(
-            build_tools(shared, shared.guard), name="johndeere-harvest"
+        mcp_config = uvicorn.Config(
+            build_server(shared, shared.guard).streamable_http_app(),
+            host=args.host,
+            port=args.mcp_port,
+            log_level="warning",
+            access_log=False,
         )
-        mcp_server = await serve_http(endpoint.handle, args.host, args.mcp_port)
+        mcp_task = asyncio.create_task(uvicorn.Server(mcp_config).serve())
         asyncio.create_task(drive(shared))
         print(f"MCP tools on http://{args.host}:{args.mcp_port}/mcp")
         if args.wake_url:
@@ -564,8 +567,8 @@ async def main() -> None:
         try:
             await asyncio.Future()
         finally:
-            if mcp_server is not None:
-                mcp_server.close()
+            if mcp_task is not None:
+                mcp_task.cancel()
 
 
 if __name__ == "__main__":

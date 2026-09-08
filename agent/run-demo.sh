@@ -21,14 +21,22 @@ command -v openclaw >/dev/null || {
 [ -f "$CONFIG" ] || {
   echo "No config at $CONFIG. Copy agent/openclaw.example.json5 there." >&2; exit 1; }
 
+# `openclaw config get` redacts secrets, so the token has to come from the file.
+# Errors are shown rather than swallowed: the README tells you to copy a .json5
+# example over this path, and strict JSON chokes on its comments — which used to
+# surface as a puzzling "no hooks.token" instead of "your config did not parse".
 TOKEN=$(python3 -c "
-import json,sys
-print(json.load(open('$CONFIG')).get('hooks',{}).get('token',''))" 2>/dev/null || true)
+import json, sys
+try:
+    print(json.load(open('$CONFIG')).get('hooks', {}).get('token', ''))
+except json.JSONDecodeError as error:
+    sys.exit(f'{error}. If you copied the .json5 example, strip its comments — '
+             'OpenClaw reads JSON5, this script reads JSON.')") || {
+  echo "Could not read $CONFIG" >&2; exit 1; }
 [ -n "$TOKEN" ] || { echo "No hooks.token in $CONFIG." >&2; exit 1; }
 
-PORT=$(python3 -c "
-import json
-print(json.load(open('$CONFIG')).get('gateway',{}).get('port', 18789))")
+# This one goes through OpenClaw, which parses its own config properly.
+PORT=$(openclaw config get gateway.port 2>/dev/null | grep -E '^[0-9]+$' || echo 18789)
 
 cleanup() {
   trap - INT TERM EXIT

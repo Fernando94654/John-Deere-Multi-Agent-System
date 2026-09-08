@@ -14,11 +14,13 @@ agent's job, and refusing to do anything is a valid answer.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import urllib.error
+import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
-
-from .http import post_json
 
 #: A situation has to persist this long before it is worth waking anybody.
 WAITING_TICKS = 12
@@ -28,6 +30,35 @@ DEBOUNCE = 80
 BACKLOG = 12
 #: Sustained share of the fleet standing still that counts as a bottleneck.
 IDLE_RATIO = 0.45
+
+
+async def post_json(url: str, payload: dict, token: Optional[str] = None) -> int:
+    """POST `payload` as JSON and return the status code; 0 if it never landed.
+
+    Blocking `urllib` on a worker thread: the supervisor is woken a handful of
+    times per campaign, so a thread hop costs nothing and saves a dependency.
+    This is the one piece of HTTP the simulation speaks *outwards*, which is why
+    it lives here and not with the MCP server the SDK provides.
+    """
+
+    def send() -> int:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        if token:
+            request.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+        except OSError:
+            return 0
+
+    return await asyncio.to_thread(send)
 
 
 @dataclass
@@ -127,10 +158,7 @@ class Watcher:
             + f" Tick {sim.tick}. Read get_fleet_state before deciding, and say "
             "plainly if the right call is to do nothing."
         )
-        # The gateway has two hooks and they disagree on the field name:
-        # /hooks/agent runs a turn for one named agent and reads `message`,
-        # /hooks/wake queues an event for the main session and reads `text`.
-        # Sending both means either endpoint works, and the URL alone decides.
+        # /hooks/agent reads `message`, /hooks/wake reads `text`; send both.
         payload: dict = {"message": message, "text": message}
         if self.agent_id:
             payload["agentId"] = self.agent_id

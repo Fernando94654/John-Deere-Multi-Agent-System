@@ -103,8 +103,7 @@ class Simulation:
         )
         self.zones = partition_zones(self.field, self.reachable, config.harvesters)
 
-        # One shared object: retuning it reaches the harvesters and the auction
-        # at once, which is what lets the supervisor change policy mid-campaign.
+        # One shared object, so retuning it reaches the harvesters and the auction.
         self.policy = Policy()
 
         self.harvesters = [
@@ -360,8 +359,7 @@ class Simulation:
         harvester.state = HarvesterState.DISABLED
         harvester.follow(None)
         harvester.unloading = False
-        # Its claim on the ground goes with it: leaving the old zone behind
-        # would paint a region on screen that nobody is working any more.
+        # Its claim goes with it, or the screen keeps a region nobody works.
         harvester.zone = set()
         harvester.plan = []
         self.rebalance()
@@ -508,17 +506,17 @@ class Simulation:
         self.tick += 1
 
         for harvester in self.harvesters:
-            # One already heading home needs no cart: it empties its own tank.
-            going_home = harvester.state in (
+            # One heading home empties its own tank; a broken one never docks at all.
+            going_home = harvester.disabled or harvester.state in (
                 HarvesterState.RETURNING,
                 HarvesterState.DONE,
             )
             if harvester.wants_cart and harvester.load > 0 and not going_home:
                 self.dispatcher.post(harvester, self.tick)
-        # Put back any request whose cart quietly walked away, before the
-        # auction runs: otherwise it is invisible to the bidding for good.
+        # Put back requests whose cart walked away, or the bidding never sees them.
         self.dispatcher.sync(self.carts)
-        self.dispatcher.run_auctions(self.field, self.by_id, self.carts, self.tick)
+        stuck = tuple(self.disabled_cells)
+        self.dispatcher.run_auctions(self.field, self.by_id, self.carts, self.tick, stuck)
 
         # Grain moves before anybody drives. A tank that hit 100% last tick then
         # already has room by the time its harvester decides, so a coupled pair
@@ -530,8 +528,7 @@ class Simulation:
 
         for harvester in self.harvesters:
             if harvester.disabled:
-                # Broken down: it does not decide, drive, cut or burn fuel. It
-                # is still in `self.agents`, so it keeps blocking its cell.
+                # Broken: no decision, drive or fuel, but it still blocks its cell.
                 continue
 
             harvester.decide(self.field, self._cart_beside(harvester))
@@ -555,7 +552,7 @@ class Simulation:
 
         for cart in self.carts:
             target = self.by_id.get(cart.target_id) if cart.target_id is not None else None
-            cart.decide(self.field, target, self.work_pending)
+            cart.decide(self.field, target, self.work_pending, stuck)
 
             if cart.state is CartState.UNLOADING:
                 self.delivered += cart.unload()

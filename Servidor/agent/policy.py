@@ -18,15 +18,10 @@ from collections import deque
 from dataclasses import dataclass, field as dataclass_field
 from typing import Any, Optional
 
-#: How many world-changing calls the supervisor may make per window of ticks.
-#: A supervisor that redraws the zones every tick tears up the serpentine sweep
-#: faster than it can rebalance it, so the budget is the difference between
-#: steering the fleet and shaking it.
+#: World-changing calls allowed per window: steering the fleet, not shaking it.
 DEFAULT_BUDGET = 3
 DEFAULT_WINDOW = 60
-#: The same window in seconds. A paused or finished run stops advancing the
-#: tick, and a budget measured only in ticks would then never refill — three
-#: commands and the supervisor is locked out of its own fleet for good.
+#: The same window in seconds, so a paused run still refills the budget.
 DEFAULT_SECONDS = 30.0
 
 
