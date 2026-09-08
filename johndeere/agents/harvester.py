@@ -16,11 +16,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional
 
-from ..config import (
-    FUEL_PER_CELL_HARVESTER,
-    HARVESTER_TANK,
-    REQUEST_THRESHOLD,
-)
+from ..config import FUEL_PER_CELL_HARVESTER, HARVESTER_TANK, Policy
 from ..planning.pathfinding import a_star
 from ..world.field import Field, heading_for_dock
 from ..world.grid import Cell
@@ -37,6 +33,7 @@ class HarvesterState(str, Enum):
     WAITING_CART = "waiting cart"
     RETURNING = "returning"
     DONE = "done"
+    DISABLED = "disabled"
 
 
 class Harvester(Agent):
@@ -44,8 +41,16 @@ class Harvester(Agent):
 
     prefix = "H"
 
-    def __init__(self, agent_id: int, position: Cell, zone: set[Cell], plan: list[Cell]):
+    def __init__(
+        self,
+        agent_id: int,
+        position: Cell,
+        zone: set[Cell],
+        plan: list[Cell],
+        policy: Optional[Policy] = None,
+    ):
         super().__init__(agent_id, position, FUEL_PER_CELL_HARVESTER)
+        self.policy = policy or Policy()
         self.zone = zone
         self.plan = list(plan)
         self.load = 0
@@ -54,6 +59,8 @@ class Harvester(Agent):
         self.requested = False
         self.cart_id: Optional[int] = None
         self.unloading = False
+        #: Consecutive ticks spent pinned with a full tank and no cart alongside.
+        self.waiting_ticks = 0
 
     # --- state queries ----------------------------------------------------
     @property
@@ -64,11 +71,16 @@ class Harvester(Agent):
     @property
     def wants_cart(self) -> bool:
         """True once the tank crosses the threshold that calls for a cart."""
-        return self.load >= REQUEST_THRESHOLD * HARVESTER_TANK
+        return self.load >= self.policy.request_threshold * HARVESTER_TANK
 
     @property
     def done(self) -> bool:
         return self.state is HarvesterState.DONE
+
+    @property
+    def disabled(self) -> bool:
+        """True for a machine that has broken down and no longer works."""
+        return self.state is HarvesterState.DISABLED
 
     def receive_from_tank(self, units: int) -> int:
         """Hand `units` of grain to a cart; returns what was actually taken."""
@@ -98,7 +110,7 @@ class Harvester(Agent):
         `cart_cell` is where this harvester's assigned cart is standing, when it
         has pulled up alongside.
         """
-        if self.state is HarvesterState.DONE:
+        if self.state in (HarvesterState.DONE, HarvesterState.DISABLED):
             return
 
         if self.load == 0 or cart_cell is None:

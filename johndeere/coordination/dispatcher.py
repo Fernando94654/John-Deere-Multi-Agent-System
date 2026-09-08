@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dataclass_field
 from typing import TYPE_CHECKING, Optional
 
-from ..config import WAIT_WEIGHT
+from ..config import Policy
 from ..planning.pathfinding import a_star
 from ..world.field import Field
 
@@ -39,6 +39,7 @@ class Dispatcher:
 
     requests: dict[int, UnloadRequest] = dataclass_field(default_factory=dict)
     auctions_run: int = 0
+    policy: Policy = dataclass_field(default_factory=Policy)
 
     def post(self, harvester: "Harvester", tick: int) -> None:
         """Register a request, if that harvester has not posted one already."""
@@ -64,6 +65,24 @@ class Dispatcher:
         """Requests still waiting for a cart."""
         return [r for r in self.requests.values() if r.served_by is None]
 
+    def sync(self, carts: list["GrainCart"]) -> int:
+        """Reopen requests whose cart has stopped serving them.
+
+        A cart releases itself when it fills up or loses the dock, and it does
+        so without going through the dispatcher. The request would otherwise
+        stay assigned to a cart that is never coming: it never reappears in
+        `pending`, nobody bids on it again, and the harvester waits out the rest
+        of the campaign with a full tank. Returns how many were put back.
+        """
+        reopened = 0
+        for request in self.requests.values():
+            if request.served_by is None:
+                continue
+            if carts[request.served_by].target_id != request.harvester_id:
+                request.served_by = None
+                reopened += 1
+        return reopened
+
     def bid(
         self, field: Field, cart: "GrainCart", harvester: "Harvester", tick: int
     ) -> Optional[float]:
@@ -74,13 +93,22 @@ class Dispatcher:
         have room for the whole tank and would have to come back. A cart with no
         route over cut ground yet cannot bid at all — it waits for the harvester
         to open one.
+
+        The price is the drive to the **berth**, not to the harvester's own
+        cell: that is where the cart is actually going, and a harvester whose
+        tank filled up on a cell it could not then cut is standing on standing
+        crop — routing to it would fail and leave the machine waiting for a cart
+        that no rule allows anyone to send.
         """
-        route = a_star(field, cart.position, harvester.position, avoid_crop=True)
+        dock = cart.station(field, harvester)
+        if dock is None:
+            return None
+        route = a_star(field, cart.position, dock, avoid_crop=True)
         if route is None:
             return None
         shortfall = max(0, harvester.load - cart.free_capacity)
         waited = self.requests[harvester.id].waiting(tick)
-        return len(route) + shortfall * 2 - waited * WAIT_WEIGHT
+        return len(route) + shortfall * 2 - waited * self.policy.wait_weight
 
     def run_auctions(
         self,
