@@ -41,8 +41,11 @@ frontends/
   replay.py                   rebuilding the field tick by tick
   console.py                  ASCII render + ANSI animation
   visual.py                   2D animation with matplotlib
+  dashboard/index.html        the web dashboard the JSON API serves (§12)
 Servidor/
   server.py                   WebSocket bridge to the Unity client (§10)
+  web.py                      HTTP + SSE dashboard API (§12, WEB_API.md)
+  WEB_API.md                  every web endpoint, with payloads and examples
   agent/                      MCP supervision layer (§11)
     tools.py                  what the supervisor may read and change
     policy.py                 the gate every command passes, and the audit trail
@@ -954,3 +957,43 @@ goes down** — a machine that would have parked is now driving.
 Which is the argument for the layer rather than against it. A fixed rule cannot tell
 2H/1C from 4H/2C. The supervisor reads the fleet, the idle ratio and the spread before
 deciding, and "do nothing" is an answer it is explicitly told to prefer.
+
+---
+
+## 12. The web dashboard (`Servidor/web.py`)
+
+The third consumer of the one running campaign. Unity draws it (§10), an MCP agent steers
+it (§11), and this serves it to a **browser**: an HTTP + SSE JSON API shaped for charts —
+time series, KPIs, per-machine state, the audit trail — plus the same command surface the
+MCP tools cover. Like the MCP app it is a Starlette app on the bridge's own event loop,
+reading the shared `Session`.
+
+```bash
+python3 Servidor/server.py --web-port 8080 --autostart
+#   http://localhost:8080/          the dashboard
+#   http://localhost:8080/api/...   the JSON API
+```
+
+`--web-port 0` (default) is off. Turning it on flips the bridge into shared-world mode,
+exactly as `--with-mcp` does; the two compose. `--web-token` guards the mutating routes.
+
+| | |
+|---|---|
+| **Reads** | `/api/config` · `/api/state` · `/api/state/stream` (SSE) · `/api/field` · `/api/history` · `/api/events` · `/api/decisions` · `/api/runs` |
+| **Commands** | `/api/commands/{start,pause,continue,reset,restart}` · `/api/config` · `/api/policy` · `/api/rebalance` · `/api/carts` · `/api/prioritize` · `/api/machines/{id}/{disable,repair}` · `/api/announce` |
+
+The headline read is `/api/state/stream`: one Server-Sent Event per tick carrying the
+KPIs (`utilization`, `fieldComplete`, `fuelPerUnit`, open cart requests), the fleet
+metrics, and a per-machine row with cumulative fuel and tank fill. `/api/history` backs
+the same shape with a 6000-tick buffer so a page opening mid-run can backfill its charts.
+
+The transport controls are `start` / `pause` / `continue` / `reset`. Pause and resume
+were always there (`Session.pause`/`resume`, behind the Unity `pause`/`resume` commands
+and the MCP `pause_run`/`resume_run` tools); `reset` is new — it rebuilds the *same*
+field from tick 1 and holds it paused at the opening frame, which `restart` (rebuild and
+run) never did. All four are also in `/api/decisions`, alongside the agent's own commands.
+
+**Full reference — every payload, status code and `curl` example — is in
+[`Servidor/WEB_API.md`](Servidor/WEB_API.md).** The engine gained nothing for this: the
+server keeps a rolling per-tick sample and a per-run summary, and everything else is
+`Simulation.diagnostics()` and the existing command methods behind an HTTP route.
