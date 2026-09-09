@@ -41,7 +41,7 @@ from johndeere.config import HARVESTER_TANK, REQUEST_THRESHOLD, SimulationConfig
 from johndeere.simulation import Simulation
 from johndeere.world.grid import OBSTACLE
 
-from agent import Guard, Watcher, build_server
+from Servidor.agent import Guard, Watcher, build_server
 
 MIN_SIDE = 6
 
@@ -225,123 +225,95 @@ class Session:
 
     # --- commands ---------------------------------------------------------
 
-    def start(self, rows: int, cols: int) -> None:
-        """Attach to the run in progress, or build the first one at this size.
-
-        Deliberately idempotent. A client's opening handshake is a `start`, and
-        so is any message that arrives without a recognisable command, so this
-        must never be the thing that tears down a campaign somebody is
-        watching. Once a run exists the size arguments are ignored and the
-        client simply joins it; rebuilding is what `restart` is for.
-        """
+    def start(self, rows=None, cols=None, **changes) -> dict:
+        """Start explicitly; joining an existing run never rebuilds it."""
         if self.sim is not None:
-            if (rows, cols) != (self.rows, self.cols):
-                print(
-                    f"Client asked to start at {rows}x{cols}, but a run is already "
-                    f"going at {self.rows}x{self.cols}; joining it instead. Send "
-                    f"'restart' to build a new field."
-                )
-            self.running.set()
-            return
+            new_seed = changes.pop('new_seed', False)
+            requested = self.parameters(rows=rows, cols=cols, **changes)
+            if new_seed or requested != self.parameters():
+                raise ValueError('a run already exists; use restart_run or POST /api/commands/restart to change its configuration')
+            self.resume()
+            return self.parameters()
+        return self.restart(rows, cols, **changes)
 
-        self._plan_rebuild(rows, cols)
+    def parameters(self, **changes) -> dict:
+        """Resolve omitted values against current settings (initially CLI defaults)."""
+        values = dict(rows=self.rows, cols=self.cols, harvesters=self.n_harvesters,
+                      carts=self.n_carts, min_obstacles=self.min_obstacles,
+                      max_obstacles=self.max_obstacles)
+        limits = dict(rows=(MIN_SIDE, 200), cols=(MIN_SIDE, 200),
+                      harvesters=(1, 64), carts=(1, 6),
+                      min_obstacles=(0, 40000), max_obstacles=(0, 40000))
+        for key, value in changes.items():
+            if key not in values:
+                raise ValueError(f"unknown run parameter: {key}")
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{key} must be an integer")
+            low, high = limits[key]
+            if not low <= value <= high:
+                raise ValueError(f"{key} must be between {low} and {high}")
+            values[key] = value
+        if values['min_obstacles'] > values['max_obstacles']:
+            raise ValueError("min_obstacles cannot exceed max_obstacles")
+        return values
 
-    def restart(self, rows: int, cols: int, new_seed: bool = False) -> None:
-        """Build a fresh run, at a new size if one was asked for, and run it."""
-        if new_seed:
-            self.seed = None
-        self._plan_rebuild(rows, cols, resume=True)
+    def restart(self, rows=None, cols=None, new_seed=False, *, resume=True, **changes) -> dict:
+        """Atomically validate and install a run before answering Web/MCP/Unity.
 
-    def reset(self) -> None:
-        """Rebuild the current field from tick 1 and hold at the start.
-
-        Same size and same seed, so the field comes back identical. Unlike
-        `restart` it does not begin ticking — the driver publishes the opening
-        frame and then waits, so the operator's Start (or Continue) button is
-        what sets it going. This is the Reset of the four-button panel.
+        Omitted values keep the current configuration, initially the CLI defaults.
+        A failed candidate never modifies the existing field or configuration.
         """
-        self._plan_rebuild(self.rows, self.cols, resume=False)
-
-    def _plan_rebuild(self, rows: int, cols: int, resume: bool = True) -> None:
-        """Queue a rebuild for the driver, which owns swapping the world out.
-
-        `resume` is whether the fresh run starts ticking straight away
-        (`restart`) or is held paused at its first frame (`reset`).
-        """
-        if rows < MIN_SIDE or cols < MIN_SIDE:
-            print(
-                f"Asked for {rows}x{cols}, but with {self.args.border} of headland "
-                f"a field smaller than {MIN_SIDE}x{MIN_SIDE} has no crop; ignored"
-            )
-            return
-
-        self.rows, self.cols = rows, cols
-
-        # The driver owns the rebuild, so no run is swapped out mid-send.
-        self.rebuild_pending = True
+        if not isinstance(new_seed, bool):
+            raise ValueError("new_seed must be a boolean")
+        values = self.parameters(rows=rows, cols=cols, **changes)
+        seed = random.randrange(2**31) if new_seed or self.seed is None else self.seed
+        candidate = Simulation(SimulationConfig(**values, seed=seed, border=self.args.border))
+        shortfall = fleet_shortfall(candidate)
+        if shortfall:
+            raise ValueError(shortfall)
+        initial_crop = candidate.food_left_reachable()
+        snapshot = candidate.step()
+        if self.sim is not None and self.sim.tick > 0:
+            self.runs.append(self.run_summary())
+        self.rows, self.cols = values['rows'], values['cols']
+        self.n_harvesters, self.n_carts = values['harvesters'], values['carts']
+        self.min_obstacles, self.max_obstacles = values['min_obstacles'], values['max_obstacles']
+        self.seed, self.sim = seed, candidate
+        self.obstacles = obstacle_cells(candidate)
+        self.run_id += 1
+        self.rebuild_pending = False
+        self.narration = None
+        self.initial_crop = initial_crop
+        self.history.clear()
+        self.state_ticks = {agent.label: {} for agent in candidate.agents}
+        self.last_state = build_state(candidate, snapshot, self.obstacles, self.args.delay)
+        self.record_history()
         if resume:
             self.running.set()
         else:
             self.running.clear()
+        self.notify("running" if resume else "paused")
+        print(f"Run {self.run_id}: field {self.rows}x{self.cols}, "
+              f"{self.n_harvesters} harvesters, {self.n_carts} carts")
+        return values
+
+    def reset(self) -> dict:
+        """Rebuild the same configuration and seed, holding the opening frame."""
+        return self.restart(resume=False)
 
     def pause(self) -> None:
         self.running.clear()
-        print("Paused")
+        self.notify("paused" if self.sim is not None else "idle")
 
     def resume(self) -> None:
-        if self.sim is None and not self.rebuild_pending:
-            print("Nothing to resume; the run has to be started first")
-            return
-
+        if self.sim is None:
+            raise ValueError("no run in progress; start or restart first")
         self.running.set()
-        print("Resumed")
+        self.notify("running")
 
     # --- lifecycle --------------------------------------------------------
-
-    def rebuild(self) -> None:
-        """Build a fresh run and adopt it, but only if it is worth watching.
-
-        The candidate is built into a local first. A field that cannot be
-        partitioned, or one too small for the fleet to do anything interesting
-        on, must not take the running campaign down with it — so on a refusal
-        the previous run keeps ticking and the reason goes to the log, the same
-        way an undersized field is already handled.
-        """
-        seed = random.randrange(2**31) if self.seed is None else self.seed
-
-        try:
-            candidate = Simulation(self._config(seed))
-        except ValueError as error:
-            print(f"Refused {self.rows}x{self.cols}: {error}")
-            return
-
-        shortfall = fleet_shortfall(candidate)
-        if shortfall is not None:
-            print(f"Refused {self.rows}x{self.cols}: {shortfall}")
-            return
-
-        # The outgoing run, if it got anywhere, goes into the archive the
-        # dashboard reads for run-to-run comparison.
-        if self.sim is not None and self.sim.tick > 0:
-            self.runs.append(self.run_summary())
-
-        self.seed = seed
-        self.sim = candidate
-        self.obstacles = obstacle_cells(self.sim)
-        self.run_id += 1
-        self.last_state = None
-
-        # Chart history belongs to one run; drop it and start the state tally
-        # fresh for the machines this field has.
-        self.initial_crop = candidate.food_left_reachable()
-        self.history.clear()
-        self.state_ticks = {agent.label: {} for agent in candidate.agents}
-
-        print(
-            f"Run {self.run_id}: field {self.rows}x{self.cols}, seed {self.seed}, "
-            f"{len(self.sim.harvesters)} harvesters, {len(self.sim.carts)} carts, "
-            f"{len(self.obstacles)} obstacles"
-        )
 
     def _config(self, seed: Optional[int]) -> SimulationConfig:
         """The config for the next rebuild, from the current (web-tunable) knobs."""
@@ -355,29 +327,6 @@ class Session:
             min_obstacles=self.min_obstacles,
             max_obstacles=self.max_obstacles,
         )
-
-    def reconfigure(self, **changes) -> dict:
-        """Apply web-supplied run parameters. The caller queues the rebuild."""
-        if "rows" in changes:
-            self.rows = int(changes["rows"])
-        if "cols" in changes:
-            self.cols = int(changes["cols"])
-        if "harvesters" in changes:
-            self.n_harvesters = max(1, int(changes["harvesters"]))
-        if "carts" in changes:
-            self.n_carts = max(1, int(changes["carts"]))
-        if "min_obstacles" in changes:
-            self.min_obstacles = max(0, int(changes["min_obstacles"]))
-        if "max_obstacles" in changes:
-            self.max_obstacles = max(self.min_obstacles, int(changes["max_obstacles"]))
-        return {
-            "rows": self.rows,
-            "cols": self.cols,
-            "harvesters": self.n_harvesters,
-            "carts": self.n_carts,
-            "minObstacles": self.min_obstacles,
-            "maxObstacles": self.max_obstacles,
-        }
 
     def run_summary(self) -> dict:
         """One finished (or in-flight) run boiled down to the headline numbers."""
@@ -460,29 +409,14 @@ class Session:
 
 def apply_command(session: Session, message: dict) -> None:
     """Route one command onto the session. Unknown commands are ignored."""
-    command = message.get("command", "start")
-
-    if command == "start":
-        # Also the fallback for a message with no command, hence idempotent.
-        session.start(
-            int(message.get("rows", session.rows)),
-            int(message.get("columns", session.cols)),
-        )
-    elif command == "restart":
-        session.restart(
-            int(message.get("rows", session.rows)),
-            int(message.get("columns", session.cols)),
-            new_seed=bool(message.get("newSeed")),
-        )
-    elif command == "pause":
-        session.pause()
-    elif command == "resume":
-        session.resume()
-    else:
-        print(f"Unknown command: {command!r}")
+    from Servidor.controls import RunControls
+    command = message.get("command")
+    if command is None:
+        return  # Connecting/subscribing is not an instruction to start a run.
+    RunControls(session).command(command, {k: v for k, v in message.items() if k != "command"})
 
 
-async def read_commands(websocket, session: Session) -> None:
+async def read_commands(websocket, session: Session, *, shared_viewer: bool = False) -> None:
     """Receive commands for as long as the client is connected.
 
     This task never writes to the socket: `websockets` gives no guarantee for
@@ -499,6 +433,10 @@ async def read_commands(websocket, session: Session) -> None:
             print("Expected a JSON object; ignored")
             continue
 
+        # Unity sends start automatically when its scene connects. In shared
+        # mode that is a subscription, not permission to start/resume the field.
+        if shared_viewer and message.get("command", "start") == "start":
+            continue
         try:
             apply_command(session, message)
         except (ValueError, TypeError) as error:
@@ -531,22 +469,8 @@ def _emit(session: Session, status: str) -> None:
 
 
 async def drive(session: Session) -> None:
-    """Advance the run and build each new state. The only writer of the world."""
+    """Advance ticks on the same event loop as the synchronous control methods."""
     while True:
-        # Rebuilds are handled before the pause gate, so a `reset` swaps the
-        # field in and shows its opening frame even while the run is held.
-        if session.rebuild_pending:
-            session.rebuild_pending = False
-            session.rebuild()
-            if session.sim is not None and not session.running.is_set():
-                # A reset: build the fresh field's opening frame here; the pause
-                # gate just below is what actually publishes it.
-                snapshot = session.sim.step()
-                session.last_state = build_state(
-                    session.sim, snapshot, session.obstacles, session.args.delay
-                )
-                session.record_history()
-
         if not session.running.is_set():
             # A whole state, not a bare status: Unity drops anything missing the world.
             if session.last_state is not None:
@@ -609,7 +533,7 @@ async def handle_client(websocket, args: argparse.Namespace, shared: Optional[Se
     print("Client connected. Waiting for the run to be started...")
 
     tasks = [
-        asyncio.create_task(read_commands(websocket, session)),
+        asyncio.create_task(read_commands(websocket, session, shared_viewer=shared is not None)),
         asyncio.create_task(publish(websocket, session)),
     ]
     # A private session needs its own driver; a shared one is already ticking.
@@ -743,7 +667,7 @@ async def main() -> None:
             print("No --wake-url: the supervisor is never woken, only asked")
 
     if web_enabled:
-        from web import build_web_app  # local: starlette is only needed here
+        from Servidor.web import build_web_app  # local: starlette is only needed here
 
         web_config = uvicorn.Config(
             build_web_app(shared, token=args.web_token),
