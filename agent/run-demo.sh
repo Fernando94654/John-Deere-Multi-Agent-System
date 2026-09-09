@@ -12,6 +12,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.local/node/bin:$HOME/.local/bin:$PATH"
 
+# The claude-cli backend spawns the operator's own `claude`, which would read
+# ~/.claude/CLAUDE.md and carry their personal instructions into every turn.
+# This config dir keeps the login and drops the rest.
+export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.openclaw/claude-home}"
+
 CONFIG="${OPENCLAW_CONFIG_PATH:-$HOME/.openclaw/openclaw.json}"
 PYTHON="${PYTHON:-.venv/bin/python}"
 [ -x "$PYTHON" ] || PYTHON=python3
@@ -82,7 +87,6 @@ echo "Starting the simulation..."
 "$PYTHON" -u Servidor/server.py --with-mcp --autostart \
   --rows 16 --cols 22 --harvesters 4 --carts 2 --delay 1.0 \
   --host 127.0.0.1 --mcp-port 8766 \
-  --wake-url "http://127.0.0.1:$PORT/hooks/agent" --wake-token "$TOKEN" \
   "$@" &
 SIM_PID=$!
 sleep 3
@@ -105,8 +109,9 @@ Ready. Unity connects to ws://127.0.0.1:8765.
   Talk to the supervisor:
     openclaw agent --agent farm-manager --session-key harvest -m "¿Cómo va la cosecha?"
 
-  Or just watch: the simulation wakes it on its own when the fleet gets stuck.
-  With a chat channel linked, the same thing works from your phone.
+  The simulation still spots trouble and records it — ask for list_recent_events —
+  but it never calls the model on its own. Every turn is one you asked for.
+  With a chat channel linked, the same works from your phone.
 
 EOF
 wait $SIM_PID
