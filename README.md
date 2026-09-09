@@ -647,7 +647,29 @@ measured only in ticks would never refill. Three commands and the supervisor wou
 locked out of its own fleet for good.
 
 The guarantees in §8 are properties of the engine, and they stay properties of the engine
-because nothing outside it can reach past this gate. Verified by hammering the commands at
+because nothing outside it can reach past this gate.
+
+**There is a second gate, and it took a leak to find it.** This one protects the
+simulation; nothing here restrains what the *backend* can do to the machine. With
+`claude-cli` the backend is not a model — it is Claude Code, with its own Bash, Read,
+Write and web tools. Asked what it knew about the operator, the supervisor answered with
+their name, email, git branch and session history, explained C++ on request, and quoted a
+source file it had read off disk.
+
+Three things fixed that, and the order matters because only the first is enforcement:
+
+- `~/.openclaw/claude-home/settings.json` allows `mcp__johndeere` and denies everything
+  else. `CLAUDE_CONFIG_DIR` points there, which also keeps the operator's own `CLAUDE.md`
+  and `settings.json` out of the prompt — the latter carries their organisation, repos and
+  `.env` paths.
+- `~/.openclaw/claude-home/CLAUDE.md` carries the scope rules. **They cannot live in the
+  skill**: skills load on demand, so a question about C++ never triggers the farm skill and
+  the rules never reach the prompt. Claude Code reads its `CLAUDE.md` on every turn.
+- The agent's `cwd` is an empty directory, so there is no repo to read and no branch to
+  report even if the rest failed.
+
+This is the OpenShell pattern from the NemoClaw stack, built from what shipped: OpenShell
+itself is in preview. Verified by hammering the commands at
 random — 20 seeds, ~250 calls — and checking every invariant still holds.
 
 ### 11.5 What wakes it (`agent/watcher.py`)
@@ -874,11 +896,10 @@ physical prepaid SIM; virtual numbers are mostly blocked by WhatsApp at registra
 Telegram bot has no phone number at all, its token is revocable from `@BotFather` in
 seconds, and the operator's personal account is never part of the setup.
 
-**The field never texts first.** The watcher POSTs to `/hooks/agent` with no delivery
-fields, so the turns it wakes run headless and nothing arrives unprompted. The channel
-carries the operator's orders and the replies to them, and that is all. Turning that
-around later is a config change, not a code one: `hooks.mappings` takes `channel`, `to`
-and `deliver`.
+**The field never calls the model.** `run-demo.sh` no longer passes `--wake-url`, so
+the watcher still spots trouble and records it — `list_recent_events` returns it — but
+never spends a turn on its own. Every turn is one the operator asked for. The wake path
+still exists: pass `--wake-url` to trade tokens for autonomy.
 
 `run-demo.sh` prints the channel's status in its banner, so a channel that came down
 shows up before you are on stage rather than during.

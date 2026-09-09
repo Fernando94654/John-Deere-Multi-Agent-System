@@ -547,8 +547,8 @@ class Simulation:
                     self.delivered += harvester.receive_from_tank(harvester.load)
                 harvester.decide(self.field, self._cart_beside(harvester))
             else:
-                # Waiting, turning on the spot or being emptied: all stand still.
-                harvester.hold()
+                # Emptying is work on both sides; waiting and turning are not.
+                harvester.hold(productive=harvester.state is HarvesterState.UNLOADING)
 
         for cart in self.carts:
             target = self.by_id.get(cart.target_id) if cart.target_id is not None else None
