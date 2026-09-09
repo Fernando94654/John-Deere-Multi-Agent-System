@@ -101,6 +101,10 @@ class Simulation:
         self.unreachable_food = sum(
             1 for cell in self.field.food_cells() if cell not in self.reachable
         )
+        # The day's target, fixed at sunrise: what progress is measured against.
+        self.crop_total = sum(
+            1 for cell in self.field.food_cells() if cell in self.reachable
+        )
         self.zones = partition_zones(self.field, self.reachable, config.harvesters)
 
         # One shared object, so retuning it reaches the harvesters and the auction.
@@ -455,6 +459,14 @@ class Simulation:
             "tick": self.tick,
             "finished": self.finished(),
             "crop_left": self.food_left_reachable(),
+            "crop_total": self.crop_total,
+            # Given directly because a share of the field is what an operator
+            # asks about, and models are unreliable at arithmetic.
+            "progress_pct": round(
+                100 * (self.crop_total - self.food_left_reachable())
+                / max(self.crop_total, 1)
+            ),
+            "delivered": self.delivered,
             "crop_unreachable": self.unreachable_food,
             "idle_ratio": round(self.idle_ratio, 3),
             "rebalances": self.rebalances,

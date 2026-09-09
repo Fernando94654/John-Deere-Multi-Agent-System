@@ -667,6 +667,18 @@ Three things fixed that, and the order matters because only the first is enforce
   the rules never reach the prompt. Claude Code reads its `CLAUDE.md` on every turn.
 - The agent's `cwd` is an empty directory, so there is no repo to read and no branch to
   report even if the rest failed.
+- `env.vars` in the config, not an export in `run-demo.sh`, is what points
+  `CLAUDE_CONFIG_DIR` at that directory. Put it in the launch script and one manual
+  `openclaw gateway` puts the operator's own files back in the prompt — which is exactly
+  what happened while testing this.
+
+The same `CLAUDE.md` carries the reporting register, and it has to live there for the same
+reason the scope rules do. A tick number means nothing to anyone watching a demo, so the
+supervisor is told to translate: `progress_pct` becomes "37% del campo cortado",
+`idle_ratio` becomes "las máquinas esperan transporte", and no field name is ever pasted
+into an answer. `diagnostics()` gained `crop_total`, `progress_pct` and `delivered`
+because without a total there is no share to report and the agent was left reading out raw
+cell counts.
 
 This is the OpenShell pattern from the NemoClaw stack, built from what shipped: OpenShell
 itself is in preview. Verified by hammering the commands at
