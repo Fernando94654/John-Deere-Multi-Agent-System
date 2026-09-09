@@ -30,6 +30,7 @@ import json
 import os
 import random
 import sys
+from collections import deque
 from typing import Optional
 import uvicorn
 import websockets
@@ -46,6 +47,10 @@ MIN_SIDE = 6
 
 #: Crop each harvester needs before it ever calls a cart, and the carts appear.
 MIN_CROP_PER_HARVESTER = round(REQUEST_THRESHOLD * HARVESTER_TANK)
+
+#: Per-tick samples the web dashboard can pull back for chart backfill. At the
+#: default half-second tick that is a bit under an hour of history.
+HISTORY_LIMIT = 6000
 
 
 def fleet_shortfall(sim: Simulation) -> Optional[str]:
@@ -191,6 +196,23 @@ class Session:
         self.seed = args.seed
         self.run_id = 0
 
+        # Run parameters the web dashboard may retune. They start from the CLI
+        # flags; POST /api/config swaps them out and queues a rebuild. The Unity
+        # bridge only ever changed rows and columns, so these lived on `args`.
+        self.n_harvesters = args.harvesters
+        self.n_carts = args.carts
+        self.min_obstacles = args.min_obstacles
+        self.max_obstacles = args.max_obstacles
+
+        # What the dashboard reads that Unity does not: a rolling per-tick sample
+        # for the charts, a per-machine tally of time spent in each state, the
+        # crop standing when the run began (for a "field %" figure), and a
+        # summary of every finished run for side-by-side comparison.
+        self.history: deque[dict] = deque(maxlen=HISTORY_LIMIT)
+        self.state_ticks: dict[str, dict[str, int]] = {}
+        self.initial_crop = 0
+        self.runs: list[dict] = []
+
         self.watcher = watcher or Watcher()
         self.guard = Guard()
 
@@ -225,13 +247,27 @@ class Session:
         self._plan_rebuild(rows, cols)
 
     def restart(self, rows: int, cols: int, new_seed: bool = False) -> None:
-        """Build a fresh run, at a new size if one was asked for."""
+        """Build a fresh run, at a new size if one was asked for, and run it."""
         if new_seed:
             self.seed = None
-        self._plan_rebuild(rows, cols)
+        self._plan_rebuild(rows, cols, resume=True)
 
-    def _plan_rebuild(self, rows: int, cols: int) -> None:
-        """Queue a rebuild for the driver, which owns swapping the world out."""
+    def reset(self) -> None:
+        """Rebuild the current field from tick 1 and hold at the start.
+
+        Same size and same seed, so the field comes back identical. Unlike
+        `restart` it does not begin ticking — the driver publishes the opening
+        frame and then waits, so the operator's Start (or Continue) button is
+        what sets it going. This is the Reset of the four-button panel.
+        """
+        self._plan_rebuild(self.rows, self.cols, resume=False)
+
+    def _plan_rebuild(self, rows: int, cols: int, resume: bool = True) -> None:
+        """Queue a rebuild for the driver, which owns swapping the world out.
+
+        `resume` is whether the fresh run starts ticking straight away
+        (`restart`) or is held paused at its first frame (`reset`).
+        """
         if rows < MIN_SIDE or cols < MIN_SIDE:
             print(
                 f"Asked for {rows}x{cols}, but with {self.args.border} of headland "
@@ -243,14 +279,17 @@ class Session:
 
         # The driver owns the rebuild, so no run is swapped out mid-send.
         self.rebuild_pending = True
-        self.running.set()
+        if resume:
+            self.running.set()
+        else:
+            self.running.clear()
 
     def pause(self) -> None:
         self.running.clear()
         print("Paused")
 
     def resume(self) -> None:
-        if self.sim is None:
+        if self.sim is None and not self.rebuild_pending:
             print("Nothing to resume; the run has to be started first")
             return
 
@@ -271,9 +310,7 @@ class Session:
         seed = random.randrange(2**31) if self.seed is None else self.seed
 
         try:
-            candidate = Simulation(
-                build_config(self.args, self.rows, self.cols, seed)
-            )
+            candidate = Simulation(self._config(seed))
         except ValueError as error:
             print(f"Refused {self.rows}x{self.cols}: {error}")
             return
@@ -283,16 +320,124 @@ class Session:
             print(f"Refused {self.rows}x{self.cols}: {shortfall}")
             return
 
+        # The outgoing run, if it got anywhere, goes into the archive the
+        # dashboard reads for run-to-run comparison.
+        if self.sim is not None and self.sim.tick > 0:
+            self.runs.append(self.run_summary())
+
         self.seed = seed
         self.sim = candidate
         self.obstacles = obstacle_cells(self.sim)
         self.run_id += 1
         self.last_state = None
 
+        # Chart history belongs to one run; drop it and start the state tally
+        # fresh for the machines this field has.
+        self.initial_crop = candidate.food_left_reachable()
+        self.history.clear()
+        self.state_ticks = {agent.label: {} for agent in candidate.agents}
+
         print(
             f"Run {self.run_id}: field {self.rows}x{self.cols}, seed {self.seed}, "
             f"{len(self.sim.harvesters)} harvesters, {len(self.sim.carts)} carts, "
             f"{len(self.obstacles)} obstacles"
+        )
+
+    def _config(self, seed: Optional[int]) -> SimulationConfig:
+        """The config for the next rebuild, from the current (web-tunable) knobs."""
+        return SimulationConfig(
+            rows=self.rows,
+            cols=self.cols,
+            harvesters=self.n_harvesters,
+            carts=self.n_carts,
+            seed=seed,
+            border=self.args.border,
+            min_obstacles=self.min_obstacles,
+            max_obstacles=self.max_obstacles,
+        )
+
+    def reconfigure(self, **changes) -> dict:
+        """Apply web-supplied run parameters. The caller queues the rebuild."""
+        if "rows" in changes:
+            self.rows = int(changes["rows"])
+        if "cols" in changes:
+            self.cols = int(changes["cols"])
+        if "harvesters" in changes:
+            self.n_harvesters = max(1, int(changes["harvesters"]))
+        if "carts" in changes:
+            self.n_carts = max(1, int(changes["carts"]))
+        if "min_obstacles" in changes:
+            self.min_obstacles = max(0, int(changes["min_obstacles"]))
+        if "max_obstacles" in changes:
+            self.max_obstacles = max(self.min_obstacles, int(changes["max_obstacles"]))
+        return {
+            "rows": self.rows,
+            "cols": self.cols,
+            "harvesters": self.n_harvesters,
+            "carts": self.n_carts,
+            "minObstacles": self.min_obstacles,
+            "maxObstacles": self.max_obstacles,
+        }
+
+    def run_summary(self) -> dict:
+        """One finished (or in-flight) run boiled down to the headline numbers."""
+        sim = self.sim
+        metrics = sim._metrics()
+        return {
+            "runId": self.run_id,
+            "ticks": sim.tick,
+            "completed": sim.finished(),
+            # From the run itself, not the knobs — those may already hold the
+            # next run's values when this summary is taken at rebuild time.
+            "rows": sim.field.rows,
+            "cols": sim.field.cols,
+            "harvesters": len(sim.harvesters),
+            "carts": len(sim.carts),
+            "seed": self.seed,
+            "utilization": round(1 - sim.idle_ratio, 4),
+            "harvested": metrics.harvested,
+            "delivered": metrics.delivered,
+            "stranded": metrics.stranded,
+            "distance": metrics.distance,
+            "fuel": round(metrics.fuel, 2),
+            "co2": round(metrics.co2, 2),
+            "fuelPerUnit": round(metrics.fuel_per_unit, 4),
+            "collisions": sim.collisions,
+            "rebalances": sim.rebalances,
+        }
+
+    def record_history(self) -> None:
+        """Append one compact per-tick sample and update the state tally.
+
+        Called once per advanced tick by the driver, so the dashboard's charts
+        are a straight read of this buffer rather than anything recomputed.
+        """
+        sim = self.sim
+        if sim is None:
+            return
+        for harvester in sim.harvesters:
+            bucket = self.state_ticks.setdefault(harvester.label, {})
+            state = harvester.state.value
+            bucket[state] = bucket.get(state, 0) + 1
+        metrics = sim._metrics()
+        self.history.append(
+            {
+                "tick": sim.tick,
+                "utilization": round(1 - sim.idle_ratio, 4),
+                "harvested": metrics.harvested,
+                "delivered": metrics.delivered,
+                "inTransit": metrics.in_transit,
+                "stranded": metrics.stranded,
+                "fuel": round(metrics.fuel, 2),
+                "co2": round(metrics.co2, 2),
+                "distance": metrics.distance,
+                "cropLeft": sim.food_left_reachable(),
+                "openRequests": len(sim.dispatcher.pending),
+                "collisions": sim.collisions,
+                "trafficRefusals": sim.traffic.refusals,
+                "tanks": [h.load for h in sim.harvesters],
+                "cartLoads": [c.load for c in sim.carts],
+            }
         )
 
     @property
@@ -375,18 +520,39 @@ def _wake_done(task: asyncio.Task) -> None:
         print(f"Waking the supervisor failed: {task.exception()}")
 
 
+def _emit(session: Session, status: str) -> None:
+    """Step the world once, build the new state and publish it."""
+    snapshot = session.sim.step()
+    session.last_state = build_state(
+        session.sim, snapshot, session.obstacles, session.args.delay
+    )
+    session.record_history()
+    session.notify(status)
+
+
 async def drive(session: Session) -> None:
     """Advance the run and build each new state. The only writer of the world."""
     while True:
+        # Rebuilds are handled before the pause gate, so a `reset` swaps the
+        # field in and shows its opening frame even while the run is held.
+        if session.rebuild_pending:
+            session.rebuild_pending = False
+            session.rebuild()
+            if session.sim is not None and not session.running.is_set():
+                # A reset: build the fresh field's opening frame here; the pause
+                # gate just below is what actually publishes it.
+                snapshot = session.sim.step()
+                session.last_state = build_state(
+                    session.sim, snapshot, session.obstacles, session.args.delay
+                )
+                session.record_history()
+
         if not session.running.is_set():
             # A whole state, not a bare status: Unity drops anything missing the world.
             if session.last_state is not None:
                 session.notify("paused")
             await session.running.wait()
-
-        if session.rebuild_pending:
-            session.rebuild_pending = False
-            session.rebuild()
+            continue
 
         if session.sim is None:
             # The first build was refused: wait for a good start rather than crash.
@@ -402,11 +568,7 @@ async def drive(session: Session) -> None:
                 )
             session.notify("finished")
         else:
-            snapshot = session.sim.step()
-            session.last_state = build_state(
-                session.sim, snapshot, session.obstacles, session.args.delay
-            )
-            session.notify("running")
+            _emit(session, "running")
 
             events = session.watcher.scan(session.sim)
             if events:
@@ -521,6 +683,20 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="build the run at startup instead of waiting for a client to ask",
     )
+
+    web = parser.add_argument_group("web dashboard")
+    web.add_argument(
+        "--web-port",
+        type=int,
+        default=0,
+        help="serve the HTML dashboard and JSON API on this port; 0 (default) "
+        "is off. Like --with-mcp, turning it on makes every client share one world",
+    )
+    web.add_argument(
+        "--web-token",
+        default=None,
+        help="bearer token required for the mutating (POST) web routes",
+    )
     return parser.parse_args(argv)
 
 
@@ -530,18 +706,28 @@ async def main() -> None:
     # Fail here, not in a handler where the traceback reaches Unity as a disconnect.
     build_config(args, args.rows, args.cols, args.seed).validate()
 
+    web_enabled = bool(args.web_port and args.web_port > 0)
+
+    # Either extra surface — MCP or the web dashboard — needs one canonical run
+    # for every client to watch, so it also flips the bridge into shared-world
+    # mode. The lone driver task lives here, not per connection.
     shared: Optional[Session] = None
-    mcp_task = None
-    if args.with_mcp:
-        shared = Session(
-            args,
+    side_tasks: list[asyncio.Task] = []
+    if args.with_mcp or web_enabled:
+        watcher = (
             Watcher(
                 args.wake_url,
                 args.wake_token,
                 agent_id=args.wake_agent,
                 session_key=args.wake_session,
-            ),
+            )
+            if args.with_mcp
+            else Watcher()
         )
+        shared = Session(args, watcher)
+        side_tasks.append(asyncio.create_task(drive(shared)))
+
+    if args.with_mcp:
         mcp_config = uvicorn.Config(
             build_server(shared, shared.guard).streamable_http_app(),
             host=args.host,
@@ -549,15 +735,28 @@ async def main() -> None:
             log_level="warning",
             access_log=False,
         )
-        mcp_task = asyncio.create_task(uvicorn.Server(mcp_config).serve())
-        asyncio.create_task(drive(shared))
+        side_tasks.append(asyncio.create_task(uvicorn.Server(mcp_config).serve()))
         print(f"MCP tools on http://{args.host}:{args.mcp_port}/mcp")
         if args.wake_url:
             print(f"Waking the supervisor at {args.wake_url}")
         else:
             print("No --wake-url: the supervisor is never woken, only asked")
-        if args.autostart:
-            shared.start(args.rows, args.cols)
+
+    if web_enabled:
+        from web import build_web_app  # local: starlette is only needed here
+
+        web_config = uvicorn.Config(
+            build_web_app(shared, token=args.web_token),
+            host=args.host,
+            port=args.web_port,
+            log_level="warning",
+            access_log=False,
+        )
+        side_tasks.append(asyncio.create_task(uvicorn.Server(web_config).serve()))
+        print(f"Web dashboard on http://{args.host}:{args.web_port}")
+
+    if shared is not None and args.autostart:
+        shared.start(args.rows, args.cols)
 
     async def handler(websocket, *_):
         await handle_client(websocket, args, shared)
@@ -567,8 +766,8 @@ async def main() -> None:
         try:
             await asyncio.Future()
         finally:
-            if mcp_task is not None:
-                mcp_task.cancel()
+            for task in side_tasks:
+                task.cancel()
 
 
 if __name__ == "__main__":

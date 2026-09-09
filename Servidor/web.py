@@ -1,0 +1,593 @@
+"""HTTP + SSE dashboard API over a running simulation.
+
+`server.py` streams the world to Unity over WebSocket and, with `--with-mcp`,
+exposes it as MCP tools. This module adds the third audience: a browser. It
+serves a small dashboard and a JSON API shaped for charts — time series, KPIs,
+per-machine state and the supervisor's audit trail — plus the same command
+surface the MCP tools cover, so an operator can steer the run from the page.
+
+Like the MCP app it is a Starlette ASGI app served by uvicorn as a task on the
+bridge's own event loop, reading the one shared `Session`. Its handlers do no
+awaiting between reading engine state and serialising it, so a request and a
+tick never interleave and the engine's invariants hold without a lock.
+
+Every route is documented in `Servidor/WEB_API.md`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from typing import Optional
+
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import (
+    FileResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
+from starlette.routing import Route
+
+from johndeere.config import (
+    BLOCKED_TICKS_BEFORE_REROUTE,
+    CART_CAPACITY,
+    CO2_KG_PER_LITRE,
+    FUEL_PER_CELL_CART,
+    FUEL_PER_CELL_HARVESTER,
+    FUEL_PER_IDLE_TICK,
+    HARVESTER_TANK,
+    REQUEST_THRESHOLD,
+    TRANSFER_RATE,
+    UNLOAD_TICKS,
+    WAIT_WEIGHT,
+)
+from johndeere.world.grid import OBSTACLE
+
+DASHBOARD = os.path.join(
+    os.path.dirname(__file__), os.pardir, "frontends", "dashboard", "index.html"
+)
+
+#: How long the SSE stream will sit silent before sending a comment to keep the
+#: connection (and any proxy in front of it) from timing the socket out.
+SSE_KEEPALIVE = 15
+
+
+# --------------------------------------------------------------------------
+# Serialisation: engine objects into the JSON the dashboard reads
+# --------------------------------------------------------------------------
+
+def config_payload(session) -> dict:
+    """Every parameter of the run: the tunable ones and the hardcoded ones.
+
+    This is the same set that feeds Unity. The `run` block is what a form on the
+    page would POST back to `/api/config`; the rest is read-only reference.
+    """
+    policy = session.sim.policy if session.sim is not None else None
+    return {
+        "run": {
+            "rows": session.rows,
+            "cols": session.cols,
+            "harvesters": session.n_harvesters,
+            "carts": session.n_carts,
+            "border": session.args.border,
+            "minObstacles": session.min_obstacles,
+            "maxObstacles": session.max_obstacles,
+            "seed": session.seed,
+            "tickInterval": session.args.delay,
+            "maxTicks": session.sim.config.max_ticks if session.sim else None,
+        },
+        "machineSpecs": {
+            "harvesterTank": HARVESTER_TANK,
+            "cartCapacity": CART_CAPACITY,
+            "transferRate": TRANSFER_RATE,
+            "requestThreshold": REQUEST_THRESHOLD,
+            "unloadTicks": UNLOAD_TICKS,
+        },
+        "sustainability": {
+            "fuelPerCellHarvester": FUEL_PER_CELL_HARVESTER,
+            "fuelPerCellCart": FUEL_PER_CELL_CART,
+            "fuelPerIdleTick": FUEL_PER_IDLE_TICK,
+            "co2KgPerLitre": CO2_KG_PER_LITRE,
+        },
+        "coordination": {
+            "blockedTicksBeforeReroute": BLOCKED_TICKS_BEFORE_REROUTE,
+            "waitWeight": WAIT_WEIGHT,
+        },
+        # The live, retunable knobs — a copy of `set_policy`'s inputs.
+        "policy": {
+            "requestThreshold": policy.request_threshold if policy else REQUEST_THRESHOLD,
+            "waitWeight": policy.wait_weight if policy else WAIT_WEIGHT,
+        },
+    }
+
+
+def _machine_extra(agent) -> dict:
+    """The cumulative counters `diagnostics()` leaves off, per machine."""
+    return {
+        "distance": agent.distance,
+        "fuel": round(agent.fuel, 2),
+        "co2": round(agent.co2, 2),
+        "routeLen": len(agent.route),
+        "heading": {"row": agent.heading[0], "column": agent.heading[1]},
+    }
+
+
+def state_payload(session) -> dict:
+    """The current tick, judged rather than drawn: KPIs, per-machine rows, the
+    supervisor's caption. This is `Simulation.diagnostics()` plus the fleet
+    metrics and a few derived headline numbers."""
+    sim = session.sim
+    base = {
+        "status": session.status,
+        "runId": session.run_id,
+        "ready": sim is not None,
+    }
+    if sim is None:
+        base["tick"] = 0
+        return base
+
+    diag = sim.diagnostics()
+    metrics = sim._metrics()
+    initial = session.initial_crop or 1
+
+    harvesters = [
+        {
+            **row,
+            **_machine_extra(machine),
+            "tankPct": round(row["load"] / row["capacity"], 3) if row["capacity"] else 0.0,
+        }
+        for row, machine in zip(diag["harvesters"], sim.harvesters)
+    ]
+    carts = [
+        {
+            **row,
+            **_machine_extra(machine),
+            "loadPct": round(row["load"] / row["capacity"], 3) if row["capacity"] else 0.0,
+        }
+        for row, machine in zip(diag["carts"], sim.carts)
+    ]
+
+    return {
+        **base,
+        "tick": diag["tick"],
+        "finished": diag["finished"],
+        "narration": session.narration or {"text": "", "tick": 0},
+        "kpi": {
+            # The headline: share of the fleet actually working, not waiting.
+            "utilization": round(1 - diag["idle_ratio"], 4),
+            "idleRatio": diag["idle_ratio"],
+            "fieldComplete": round(1 - diag["crop_left"] / initial, 4),
+            "cropLeft": diag["crop_left"],
+            "cropUnreachable": diag["crop_unreachable"],
+            "openRequests": len(diag["open_requests"]),
+            "fuelPerUnit": round(metrics.fuel_per_unit, 4),
+            "rebalances": diag["rebalances"],
+        },
+        "metrics": {
+            "harvested": metrics.harvested,
+            "delivered": metrics.delivered,
+            "inTransit": metrics.in_transit,
+            "stranded": metrics.stranded,
+            "distance": metrics.distance,
+            "fuel": round(metrics.fuel, 2),
+            "co2": round(metrics.co2, 2),
+            "idleTicks": metrics.idle_ticks,
+            "trafficRefusals": metrics.traffic_refusals,
+            "collisions": sim.collisions,
+            "obstacleViolations": sim.obstacle_violations,
+            "auctionsRun": sim.dispatcher.auctions_run,
+        },
+        "policy": {
+            "requestThreshold": diag["policy"]["request_threshold"],
+            "waitWeight": diag["policy"]["wait_weight"],
+        },
+        "harvesters": harvesters,
+        "carts": carts,
+        "openRequests": diag["open_requests"],
+        # {machine label: {state name: ticks spent in it}} since the run began.
+        "stateHistogram": session.state_ticks,
+    }
+
+
+def field_payload(session) -> dict:
+    """The grid as flat arrays for a minimap: crop, zone ownership, rocks, the
+    machines. Cheap to poll at a low rate; it is the heavy part of the Unity
+    payload, and the charts do not need it every tick."""
+    sim = session.sim
+    if sim is None:
+        return {"ready": False}
+    return {
+        "ready": True,
+        "tick": sim.tick,
+        "runId": session.run_id,
+        "rows": sim.field.rows,
+        "columns": sim.field.cols,
+        "farm": {"row": sim.farm[0], "column": sim.farm[1]},
+        # row-major, rows*columns long: -1 rock, 0 cut, 1 standing crop.
+        "crop": [value for row in sim.field.grid for value in row],
+        # owning harvester id per cell, -1 for unowned.
+        "zones": sim.zone_map(),
+        "obstacles": [
+            {"row": r, "column": c}
+            for r, row in enumerate(sim.initial_grid)
+            for c, value in enumerate(row)
+            if value == OBSTACLE
+        ],
+        "harvesters": [
+            {
+                "id": h.label,
+                "row": h.position[0],
+                "column": h.position[1],
+                "state": h.state.value,
+            }
+            for h in sim.harvesters
+        ],
+        "carts": [
+            {
+                "id": c.label,
+                "row": c.position[0],
+                "column": c.position[1],
+                "state": c.state.value,
+            }
+            for c in sim.carts
+        ],
+    }
+
+
+def history_payload(session, since: int) -> dict:
+    """The per-tick sample buffer, for a chart to backfill when the page opens
+    mid-run. `since` is exclusive; pass the last tick you already hold."""
+    rows = [sample for sample in session.history if sample["tick"] > since]
+    return {
+        "runId": session.run_id,
+        "from": rows[0]["tick"] if rows else since,
+        "to": rows[-1]["tick"] if rows else since,
+        "count": len(rows),
+        "samples": rows,
+    }
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+async def _json_body(request: Request) -> dict:
+    try:
+        raw = await request.body()
+    except Exception:  # pragma: no cover - transport
+        return {}
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _opt_float(body: dict, key: str) -> Optional[float]:
+    value = body.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clamp(value, low: int, high: int) -> int:
+    try:
+        return max(low, min(high, int(value)))
+    except (TypeError, ValueError):
+        return low
+
+
+# --------------------------------------------------------------------------
+# The app
+# --------------------------------------------------------------------------
+
+def build_web_app(session, token: Optional[str] = None) -> Starlette:
+    """The dashboard app bound to one `Session` — the shared, canonical run."""
+
+    def authorized(request: Request) -> bool:
+        if not token:
+            return True
+        return request.headers.get("authorization", "") == f"Bearer {token}"
+
+    def unauthorized() -> JSONResponse:
+        return JSONResponse({"error": "bad or missing bearer token"}, status_code=401)
+
+    def sim_or_409() -> tuple:
+        """The live run, or a response to return instead."""
+        if session.sim is None:
+            return None, JSONResponse(
+                {"error": "no run in progress; POST /api/commands/restart first"},
+                status_code=409,
+            )
+        return session.sim, None
+
+    def log(tool: str, arguments: dict, detail: str) -> None:
+        """Put a web-issued change in the same audit trail the MCP tools use."""
+        tick = session.sim.tick if session.sim is not None else 0
+        session.guard.record(tick, f"web:{tool}", arguments, True, detail)
+
+    # --- reads ---------------------------------------------------------------
+
+    async def get_index(request: Request) -> Response:
+        if os.path.exists(DASHBOARD):
+            return FileResponse(DASHBOARD)
+        return JSONResponse(
+            {"error": "frontends/dashboard/index.html is missing"}, status_code=404
+        )
+
+    async def get_config(request: Request) -> Response:
+        return JSONResponse(config_payload(session))
+
+    async def get_state(request: Request) -> Response:
+        return JSONResponse(state_payload(session))
+
+    async def get_field(request: Request) -> Response:
+        return JSONResponse(field_payload(session))
+
+    async def get_history(request: Request) -> Response:
+        since = _clamp(request.query_params.get("since", -1), -1, 10**9)
+        return JSONResponse(history_payload(session, since))
+
+    async def get_events(request: Request) -> Response:
+        limit = _clamp(request.query_params.get("limit", 20), 1, 200)
+        return JSONResponse({"events": session.watcher.recent(limit)})
+
+    async def get_decisions(request: Request) -> Response:
+        limit = _clamp(request.query_params.get("limit", 20), 1, 200)
+        return JSONResponse({"decisions": session.guard.log(limit)})
+
+    async def get_runs(request: Request) -> Response:
+        live = []
+        if session.sim is not None and session.sim.tick > 0:
+            live = [{**session.run_summary(), "live": True}]
+        return JSONResponse({"runs": session.runs + live})
+
+    async def stream_state(request: Request) -> Response:
+        async def body():
+            # Prime the stream so a subscriber that joins between ticks is not
+            # staring at a blank page until the next one.
+            yield _sse(state_payload(session))
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    await asyncio.wait_for(
+                        session.wait_for_state(), timeout=SSE_KEEPALIVE
+                    )
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                yield _sse(state_payload(session))
+
+        return StreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # --- writes -----------------------------------------------------------
+    # Each maps onto a method that already exists, on the Session or the engine;
+    # nothing here steers a machine.
+
+    async def post_command(request: Request) -> Response:
+        if not authorized(request):
+            return unauthorized()
+        action = request.path_params["action"]
+        body = await _json_body(request)
+        queued = False
+        if action == "start":
+            # Cold start when nothing is built, otherwise a plain un-pause —
+            # `Session.start` is idempotent and never tears a run down.
+            session.start(
+                int(body.get("rows", session.rows)),
+                int(body.get("columns", body.get("cols", session.cols))),
+            )
+            queued = session.sim is None
+        elif action == "pause":
+            session.pause()
+        elif action in ("resume", "continue"):
+            session.resume()
+        elif action == "reset":
+            # Same field, back to tick 1, held paused until start/continue.
+            session.reset()
+            queued = True
+        elif action == "restart":
+            session.restart(
+                int(body.get("rows", session.rows)),
+                int(body.get("columns", body.get("cols", session.cols))),
+                new_seed=bool(body.get("newSeed")),
+            )
+            queued = True
+        else:
+            return JSONResponse(
+                {"error": f"unknown command {action!r}"}, status_code=404
+            )
+        log(f"command:{action}", body, action)
+        return JSONResponse({"status": session.status, "queued": queued})
+
+    async def post_config(request: Request) -> Response:
+        if not authorized(request):
+            return unauthorized()
+        body = await _json_body(request)
+        mapping = {
+            "rows": "rows",
+            "cols": "cols",
+            "columns": "cols",
+            "harvesters": "harvesters",
+            "carts": "carts",
+            "minObstacles": "min_obstacles",
+            "maxObstacles": "max_obstacles",
+        }
+        changes = {mapping[k]: v for k, v in body.items() if k in mapping}
+        applied = session.reconfigure(**changes)
+        # A parameter change only takes effect on a fresh field.
+        session.restart(session.rows, session.cols, new_seed=bool(body.get("newSeed")))
+        log("config", body, "rebuild queued")
+        return JSONResponse({"applied": applied, "queued": True})
+
+    async def config_endpoint(request: Request) -> Response:
+        if request.method == "POST":
+            return await post_config(request)
+        return await get_config(request)
+
+    async def post_policy(request: Request) -> Response:
+        if not authorized(request):
+            return unauthorized()
+        sim, refusal = sim_or_409()
+        if refusal:
+            return refusal
+        body = await _json_body(request)
+        threshold = _opt_float(body, "requestThreshold")
+        weight = _opt_float(body, "waitWeight")
+        if threshold is None and weight is None:
+            return JSONResponse(
+                {"error": "give requestThreshold and/or waitWeight"}, status_code=400
+            )
+        try:
+            result = sim.set_policy(request_threshold=threshold, wait_weight=weight)
+        except ValueError as error:
+            return JSONResponse({"error": str(error)}, status_code=400)
+        log("set_policy", body, str(result))
+        return JSONResponse(result)
+
+    async def post_rebalance(request: Request) -> Response:
+        if not authorized(request):
+            return unauthorized()
+        sim, refusal = sim_or_409()
+        if refusal:
+            return refusal
+        result = sim.rebalance()
+        log("rebalance", {}, str(result.get("rebalanced")))
+        return JSONResponse(result)
+
+    async def post_cart(request: Request) -> Response:
+        if not authorized(request):
+            return unauthorized()
+        sim, refusal = sim_or_409()
+        if refusal:
+            return refusal
+        if len(sim.carts) >= 6:
+            return JSONResponse(
+                {"error": "six carts is the most this field holds without gridlock"},
+                status_code=409,
+            )
+        cart_id = sim.add_cart()
+        log("add_cart", {}, f"C{cart_id}")
+        return JSONResponse({"cart": f"C{cart_id}", "fleetCarts": len(sim.carts)})
+
+    async def post_prioritize(request: Request) -> Response:
+        if not authorized(request):
+            return unauthorized()
+        sim, refusal = sim_or_409()
+        if refusal:
+            return refusal
+        body = await _json_body(request)
+        try:
+            top = (int(body["topRow"]), int(body["leftColumn"]))
+            bottom = (int(body["bottomRow"]), int(body["rightColumn"]))
+        except (KeyError, TypeError, ValueError):
+            return JSONResponse(
+                {"error": "need topRow, leftColumn, bottomRow, rightColumn"},
+                status_code=400,
+            )
+        promoted = sim.prioritize(top, bottom)
+        log("prioritize", body, f"{promoted} cells")
+        return JSONResponse(
+            {
+                "cellsPromoted": promoted,
+                "note": (
+                    "no standing crop in that region"
+                    if not promoted
+                    else "the fleet works this region first"
+                ),
+            }
+        )
+
+    async def post_machine(request: Request) -> Response:
+        if not authorized(request):
+            return unauthorized()
+        sim, refusal = sim_or_409()
+        if refusal:
+            return refusal
+        action = request.path_params["action"]
+        raw = str(request.path_params["hid"]).strip().upper().removeprefix("H")
+        try:
+            hid = int(raw)
+        except ValueError:
+            return JSONResponse(
+                {"error": "harvester id like 'H1' or 1"}, status_code=400
+            )
+        if hid not in sim.by_id:
+            return JSONResponse({"error": f"no harvester {hid}"}, status_code=404)
+        if action == "disable":
+            if sum(not h.disabled for h in sim.harvesters) <= 1:
+                return JSONResponse(
+                    {"error": "that is the last running harvester"}, status_code=409
+                )
+            changed = sim.disable(hid)
+        elif action == "repair":
+            changed = sim.repair(hid)
+        else:
+            return JSONResponse(
+                {"error": f"unknown action {action!r}"}, status_code=404
+            )
+        log(f"{action}_machine", {"harvester": hid}, str(changed))
+        return JSONResponse({"harvester": f"H{hid}", "changed": changed})
+
+    async def post_announce(request: Request) -> Response:
+        if not authorized(request):
+            return unauthorized()
+        body = await _json_body(request)
+        text = str(body.get("text", "")).strip()
+        if not text or len(text) > 160:
+            return JSONResponse(
+                {"error": "text must be 1 to 160 characters"}, status_code=400
+            )
+        session.narration = {
+            "text": text,
+            "tick": session.sim.tick if session.sim is not None else 0,
+        }
+        log("announce", {"text": text}, text)
+        return JSONResponse({"shown": text})
+
+    routes = [
+        Route("/", get_index, methods=["GET"]),
+        Route("/api/config", config_endpoint, methods=["GET", "POST"]),
+        Route("/api/state", get_state, methods=["GET"]),
+        Route("/api/state/stream", stream_state, methods=["GET"]),
+        Route("/api/field", get_field, methods=["GET"]),
+        Route("/api/history", get_history, methods=["GET"]),
+        Route("/api/events", get_events, methods=["GET"]),
+        Route("/api/decisions", get_decisions, methods=["GET"]),
+        Route("/api/runs", get_runs, methods=["GET"]),
+        Route("/api/commands/{action}", post_command, methods=["POST"]),
+        Route("/api/policy", post_policy, methods=["POST"]),
+        Route("/api/rebalance", post_rebalance, methods=["POST"]),
+        Route("/api/carts", post_cart, methods=["POST"]),
+        Route("/api/prioritize", post_prioritize, methods=["POST"]),
+        Route("/api/machines/{hid}/{action}", post_machine, methods=["POST"]),
+        Route("/api/announce", post_announce, methods=["POST"]),
+    ]
+    middleware = [
+        Middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    ]
+    return Starlette(routes=routes, middleware=middleware)
