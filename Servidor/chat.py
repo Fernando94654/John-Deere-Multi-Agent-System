@@ -18,15 +18,21 @@ BRIEF = (
 
 
 def gateway_settings():
-    path = Path(os.environ.get("OPENCLAW_CONFIG_PATH", "~/.openclaw/openclaw.json")).expanduser()
-    config = json.loads(path.read_text())
-    gateway = config.get("gateway", {})
-    auth = gateway.get("auth", {})
-    token = (os.environ.get("OPENCLAW_GATEWAY_TOKEN") or os.environ.get("OPENCLAW_GATEWAY_PASSWORD")
-             or auth.get("token") or auth.get("password"))
+    # Docker sets OPENCLAW_GATEWAY_HOST/PORT/TOKEN directly since the container has
+    # no local OpenClaw config file; a native run falls back to reading it.
+    host = os.environ.get("OPENCLAW_GATEWAY_HOST", "127.0.0.1")
+    port = os.environ.get("OPENCLAW_GATEWAY_PORT")
+    token = os.environ.get("OPENCLAW_GATEWAY_TOKEN") or os.environ.get("OPENCLAW_GATEWAY_PASSWORD")
+    if port is None or not token:
+        path = Path(os.environ.get("OPENCLAW_CONFIG_PATH", "~/.openclaw/openclaw.json")).expanduser()
+        config = json.loads(path.read_text())
+        gateway = config.get("gateway", {})
+        auth = gateway.get("auth", {})
+        port = port or gateway.get("port", 18789)
+        token = token or auth.get("token") or auth.get("password")
     if not isinstance(token, str) or not token:
         raise ValueError("Configure a gateway credential on the server")
-    return f"http://127.0.0.1:{int(gateway.get('port', 18789))}/v1/chat/completions", token
+    return f"http://{host}:{int(port)}/v1/chat/completions", token
 
 
 def event(kind, **data):

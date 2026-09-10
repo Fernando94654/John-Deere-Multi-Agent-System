@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 from typing import Optional
 
 from starlette.applications import Starlette
@@ -59,68 +58,6 @@ DASHBOARD = os.path.join(
 #: How long the SSE stream will sit silent before sending a comment to keep the
 #: connection (and any proxy in front of it) from timing the socket out.
 SSE_KEEPALIVE = 15
-
-#: Longest one operator chat turn may take before the request gives up. The
-#: dashboard aborts its own fetch at 145s; stay just under that so the caller
-#: gets our reason rather than a dead socket.
-CHAT_TIMEOUT = 140
-
-
-async def ask_supervisor(message: str, agent_id: str, session_key: str) -> str:
-    """Run one supervisor turn through the OpenClaw gateway and return its text.
-
-    `openclaw agent --json` talks to the gateway `run-demo.sh` already started,
-    so the gateway address and hook token stay on this server — the browser
-    never sees them. Raises `RuntimeError` with a message safe to show a caller.
-    """
-    binary = shutil.which("openclaw")
-    if binary is None:
-        raise RuntimeError(
-            "openclaw is not on the server's PATH, so the gateway bridge is off"
-        )
-
-    proc = await asyncio.create_subprocess_exec(
-        binary, "agent",
-        "--agent", agent_id,
-        "--session-key", session_key,
-        "--json",
-        "--message", message,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=CHAT_TIMEOUT)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError("the supervisor did not answer in time")
-
-    if proc.returncode != 0:
-        tail = (err or b"").decode("utf-8", "replace").strip().splitlines()
-        raise RuntimeError(tail[-1] if tail else f"openclaw agent exited {proc.returncode}")
-
-    try:
-        data = json.loads(out.decode("utf-8", "replace"))
-    except json.JSONDecodeError:
-        raise RuntimeError("the gateway returned an unreadable response")
-
-    if data.get("status") not in (None, "ok"):
-        raise RuntimeError(
-            str(data.get("summary") or data.get("error") or "the turn did not complete")
-        )
-
-    result = data.get("result") or {}
-    reply = str((result.get("meta") or {}).get("finalAssistantVisibleText") or "").strip()
-    if not reply:
-        reply = "".join(
-            p.get("text", "")
-            for p in (result.get("payloads") or [])
-            if isinstance(p, dict)
-        ).strip()
-    if not reply:
-        raise RuntimeError("the supervisor returned an empty reply")
-    return reply
-
 
 # --------------------------------------------------------------------------
 # Serialisation: engine objects into the JSON the dashboard reads
@@ -491,11 +428,6 @@ def build_web_app(session, token: Optional[str] = None) -> Starlette:
     chat = OpenClawChat()
 
     async def post_chat(request: Request) -> Response:
-        if not authorized(request):
-            return unauthorized()
-        return await chat.handle(request)
-
-    async def post_chat(request: Request) -> Response:
         """Relay one operator message to the supervisor and return its reply.
 
         The dashboard has no path to the gateway of its own; this is it. The run
@@ -504,25 +436,7 @@ def build_web_app(session, token: Optional[str] = None) -> Starlette:
         """
         if not authorized(request):
             return unauthorized()
-        body = await _json_body(request)
-        message = str(body.get("message", "")).strip()
-        if not message:
-            return JSONResponse({"error": "message must not be empty"}, status_code=400)
-        if len(message) > 4000:
-            return JSONResponse(
-                {"error": "message must be 4000 characters or fewer"}, status_code=400
-            )
-
-        args = session.args
-        agent_id = getattr(args, "wake_agent", None) or "farm-manager"
-        session_key = getattr(args, "wake_session", None) or "harvest"
-        try:
-            reply = await ask_supervisor(message, agent_id, session_key)
-        except RuntimeError as error:
-            log("chat", {"message": message}, f"failed: {error}")
-            return JSONResponse({"error": str(error)}, status_code=502)
-        log("chat", {"message": message}, reply[:120])
-        return JSONResponse({"reply": reply})
+        return await chat.handle(request)
 
     async def post_fleet_recommendations(request: Request) -> Response:
         """Size a harvester/cart fleet for a field and a budget.
