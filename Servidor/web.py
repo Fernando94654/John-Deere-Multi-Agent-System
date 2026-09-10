@@ -49,6 +49,8 @@ from johndeere.config import (
 )
 from johndeere.fleet_advisor import FleetCosts, recommend_fleet
 from johndeere.world.grid import OBSTACLE
+from Servidor.chat import OpenClawChat
+from Servidor.controls import RunControls
 
 DASHBOARD = os.path.join(
     os.path.dirname(__file__), os.pardir, "frontends", "dashboard", "index.html"
@@ -333,18 +335,10 @@ async def _json_body(request: Request) -> dict:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _opt_float(body: dict, key: str) -> Optional[float]:
-    value = body.get(key)
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+        raise ValueError("invalid JSON body") from None
+    if not isinstance(data, dict):
+        raise ValueError("body must be a JSON object")
+    return data
 
 
 def _clamp(value, low: int, high: int) -> int:
@@ -374,15 +368,6 @@ def build_web_app(session, token: Optional[str] = None) -> Starlette:
 
     def unauthorized() -> JSONResponse:
         return JSONResponse({"error": "bad or missing bearer token"}, status_code=401)
-
-    def sim_or_409() -> tuple:
-        """The live run, or a response to return instead."""
-        if session.sim is None:
-            return None, JSONResponse(
-                {"error": "no run in progress; POST /api/commands/restart first"},
-                status_code=409,
-            )
-        return session.sim, None
 
     def log(tool: str, arguments: dict, detail: str) -> None:
         """Put a web-issued change in the same audit trail the MCP tools use."""
@@ -452,186 +437,63 @@ def build_web_app(session, token: Optional[str] = None) -> Starlette:
     # Each maps onto a method that already exists, on the Session or the engine;
     # nothing here steers a machine.
 
-    async def post_command(request: Request) -> Response:
+    controls = RunControls(session)
+
+    async def write(request, operation, name):
         if not authorized(request):
             return unauthorized()
-        action = request.path_params["action"]
-        body = await _json_body(request)
-        queued = False
-        if action == "start":
-            # Cold start when nothing is built, otherwise a plain un-pause —
-            # `Session.start` is idempotent and never tears a run down.
-            session.start(
-                int(body.get("rows", session.rows)),
-                int(body.get("columns", body.get("cols", session.cols))),
-            )
-            queued = session.sim is None
-        elif action == "pause":
-            session.pause()
-        elif action in ("resume", "continue"):
-            session.resume()
-        elif action == "reset":
-            # Same field, back to tick 1, held paused until start/continue.
-            session.reset()
-            queued = True
-        elif action == "restart":
-            session.restart(
-                int(body.get("rows", session.rows)),
-                int(body.get("columns", body.get("cols", session.cols))),
-                new_seed=bool(body.get("newSeed")),
-            )
-            queued = True
-        else:
-            return JSONResponse(
-                {"error": f"unknown command {action!r}"}, status_code=404
-            )
-        log(f"command:{action}", body, action)
-        return JSONResponse({"status": session.status, "queued": queued})
+        try:
+            body = await _json_body(request)
+            result = operation(body)
+        except (ValueError, TypeError, KeyError) as error:
+            return JSONResponse({"error": str(error)}, status_code=getattr(error, "status", 400))
+        log(name, body, str(result))
+        return JSONResponse(result)
 
-    async def post_config(request: Request) -> Response:
-        if not authorized(request):
-            return unauthorized()
-        body = await _json_body(request)
-        mapping = {
-            "rows": "rows",
-            "cols": "cols",
-            "columns": "cols",
-            "harvesters": "harvesters",
-            "carts": "carts",
-            "minObstacles": "min_obstacles",
-            "maxObstacles": "max_obstacles",
-        }
-        changes = {mapping[k]: v for k, v in body.items() if k in mapping}
-        applied = session.reconfigure(**changes)
-        # A parameter change only takes effect on a fresh field.
-        session.restart(session.rows, session.cols, new_seed=bool(body.get("newSeed")))
-        log("config", body, "rebuild queued")
-        return JSONResponse({"applied": applied, "queued": True})
+    async def post_command(request):
+        action = request.path_params['action']
+        return await write(request, lambda body: controls.command(action, body), f'command:{action}')
 
-    async def config_endpoint(request: Request) -> Response:
-        if request.method == "POST":
-            return await post_config(request)
+    async def config_endpoint(request):
+        if request.method == 'POST':
+            return await write(request, lambda body: controls.command('config', body), 'config')
         return await get_config(request)
 
-    async def post_policy(request: Request) -> Response:
-        if not authorized(request):
-            return unauthorized()
-        sim, refusal = sim_or_409()
-        if refusal:
-            return refusal
-        body = await _json_body(request)
-        threshold = _opt_float(body, "requestThreshold")
-        weight = _opt_float(body, "waitWeight")
-        if threshold is None and weight is None:
-            return JSONResponse(
-                {"error": "give requestThreshold and/or waitWeight"}, status_code=400
-            )
-        try:
-            result = sim.set_policy(request_threshold=threshold, wait_weight=weight)
-        except ValueError as error:
-            return JSONResponse({"error": str(error)}, status_code=400)
-        log("set_policy", body, str(result))
-        return JSONResponse(result)
+    async def post_policy(request):
+        return await write(request, lambda b: controls.policy(
+            b.get('requestThreshold', b.get('request_threshold')),
+            b.get('waitWeight', b.get('wait_weight'))), 'set_policy')
 
-    async def post_rebalance(request: Request) -> Response:
-        if not authorized(request):
-            return unauthorized()
-        sim, refusal = sim_or_409()
-        if refusal:
-            return refusal
-        result = sim.rebalance()
-        log("rebalance", {}, str(result.get("rebalanced")))
-        return JSONResponse(result)
+    async def post_rebalance(request):
+        return await write(request, lambda _: controls.rebalance(), 'rebalance')
 
-    async def post_cart(request: Request) -> Response:
-        if not authorized(request):
-            return unauthorized()
-        sim, refusal = sim_or_409()
-        if refusal:
-            return refusal
-        if len(sim.carts) >= 6:
-            return JSONResponse(
-                {"error": "six carts is the most this field holds without gridlock"},
-                status_code=409,
-            )
-        cart_id = sim.add_cart()
-        log("add_cart", {}, f"C{cart_id}")
-        return JSONResponse({"cart": f"C{cart_id}", "fleetCarts": len(sim.carts)})
+    async def post_cart(request):
+        def apply(_):
+            result = controls.add_cart()
+            return {**result, 'fleetCarts': result['fleet_carts']}
+        return await write(request, apply, 'add_cart')
 
-    async def post_prioritize(request: Request) -> Response:
-        if not authorized(request):
-            return unauthorized()
-        sim, refusal = sim_or_409()
-        if refusal:
-            return refusal
-        body = await _json_body(request)
-        try:
-            top = (int(body["topRow"]), int(body["leftColumn"]))
-            bottom = (int(body["bottomRow"]), int(body["rightColumn"]))
-        except (KeyError, TypeError, ValueError):
-            return JSONResponse(
-                {"error": "need topRow, leftColumn, bottomRow, rightColumn"},
-                status_code=400,
-            )
-        promoted = sim.prioritize(top, bottom)
-        log("prioritize", body, f"{promoted} cells")
-        return JSONResponse(
-            {
-                "cellsPromoted": promoted,
-                "note": (
-                    "no standing crop in that region"
-                    if not promoted
-                    else "the fleet works this region first"
-                ),
-            }
-        )
+    async def post_prioritize(request):
+        def apply(body):
+            result = controls.prioritize(*(body.get(camel, body.get(snake)) for camel, snake in (
+                ('topRow', 'top_row'), ('leftColumn', 'left_column'),
+                ('bottomRow', 'bottom_row'), ('rightColumn', 'right_column'))))
+            return {**result, 'cellsPromoted': result['cells_promoted']}
+        return await write(request, apply, 'prioritize')
 
-    async def post_machine(request: Request) -> Response:
-        if not authorized(request):
-            return unauthorized()
-        sim, refusal = sim_or_409()
-        if refusal:
-            return refusal
-        action = request.path_params["action"]
-        raw = str(request.path_params["hid"]).strip().upper().removeprefix("H")
-        try:
-            hid = int(raw)
-        except ValueError:
-            return JSONResponse(
-                {"error": "harvester id like 'H1' or 1"}, status_code=400
-            )
-        if hid not in sim.by_id:
-            return JSONResponse({"error": f"no harvester {hid}"}, status_code=404)
-        if action == "disable":
-            if sum(not h.disabled for h in sim.harvesters) <= 1:
-                return JSONResponse(
-                    {"error": "that is the last running harvester"}, status_code=409
-                )
-            changed = sim.disable(hid)
-        elif action == "repair":
-            changed = sim.repair(hid)
-        else:
-            return JSONResponse(
-                {"error": f"unknown action {action!r}"}, status_code=404
-            )
-        log(f"{action}_machine", {"harvester": hid}, str(changed))
-        return JSONResponse({"harvester": f"H{hid}", "changed": changed})
+    async def post_machine(request):
+        action = request.path_params['action']
+        return await write(request, lambda _: controls.machine(action, request.path_params['hid']), f'{action}_machine')
 
-    async def post_announce(request: Request) -> Response:
+    async def post_announce(request):
+        return await write(request, lambda b: controls.announce(b.get('text')), 'announce')
+
+    chat = OpenClawChat()
+
+    async def post_chat(request: Request) -> Response:
         if not authorized(request):
             return unauthorized()
-        body = await _json_body(request)
-        text = str(body.get("text", "")).strip()
-        if not text or len(text) > 160:
-            return JSONResponse(
-                {"error": "text must be 1 to 160 characters"}, status_code=400
-            )
-        session.narration = {
-            "text": text,
-            "tick": session.sim.tick if session.sim is not None else 0,
-        }
-        log("announce", {"text": text}, text)
-        return JSONResponse({"shown": text})
+        return await chat.handle(request)
 
     async def post_chat(request: Request) -> Response:
         """Relay one operator message to the supervisor and return its reply.
@@ -732,6 +594,7 @@ def build_web_app(session, token: Optional[str] = None) -> Starlette:
         return JSONResponse({**envelope, "status": "completed", **result})
 
     routes = [
+        Route("/api/chat", post_chat, methods=["POST"]),
         Route("/", get_index, methods=["GET"]),
         Route("/api/config", config_endpoint, methods=["GET", "POST"]),
         Route("/api/state", get_state, methods=["GET"]),

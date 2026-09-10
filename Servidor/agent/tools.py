@@ -28,7 +28,8 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import ToolAnnotations
 
-from .policy import Guard, as_float, as_int, machine_id
+from .policy import Guard
+from Servidor.controls import RunControls
 
 ROCK, CUT, FARM, UNOWNED = "#", ".", "F", "*"
 
@@ -79,15 +80,11 @@ def field_view(sim) -> list[str]:
 def build_server(session, guard: Guard) -> MCPServer:
     """Assemble the tool surface for one session, each call behind the guard."""
     mcp = MCPServer("johndeere-harvest", version="1.0.0")
+    controls = RunControls(session)
 
     def sim():
         """The live run, or a refusal the model can act on."""
-        if session.sim is None:
-            raise ToolError(
-                "no run is in progress; ask the operator to start one, or call "
-                "restart_run to build one"
-            )
-        return session.sim
+        return controls.current()
 
     def guarded(mutating: bool = False) -> Callable:
         """Put one tool behind the budget, the argument checks and the log.
@@ -181,7 +178,7 @@ def build_server(session, guard: Guard) -> MCPServer:
         where the machines are now. Hands leftover work to whoever can reach it,
         and calls a harvester that had already parked back out. Costs fuel in
         driving, so it pays when the work is lopsided and not otherwise."""
-        return sim().rebalance()
+        return controls.rebalance()
 
     @mcp.tool(annotations=BREAKS)
     @guarded(mutating=True)
@@ -193,24 +190,8 @@ def build_server(session, guard: Guard) -> MCPServer:
         Args:
             harvester: the machine, as 'H1' or 1.
         """
-        current = sim()
-        target = machine_id({"harvester": harvester}, "harvester", len(current.harvesters))
-        if sum(not h.disabled for h in current.harvesters) <= 1:
-            raise ToolError(
-                "that is the last harvester still running; breaking it down "
-                "would leave nobody to cut the field"
-            )
-        changed = current.disable(target)
-        return {
-            "harvester": f"H{target}",
-            "disabled": changed,
-            "note": "already broken down" if not changed else "zone handed to the others",
-            "zones": [
-                {"harvester": h.label, "crop": len(h.plan)}
-                for h in current.harvesters
-                if not h.disabled
-            ],
-        }
+        result = controls.machine('disable', harvester)
+        return {**result, 'disabled': result['changed']}
 
     @mcp.tool(annotations=CHANGES)
     @guarded(mutating=True)
@@ -220,9 +201,8 @@ def build_server(session, guard: Guard) -> MCPServer:
         Args:
             harvester: the machine, as 'H1' or 1.
         """
-        current = sim()
-        target = machine_id({"harvester": harvester}, "harvester", len(current.harvesters))
-        return {"harvester": f"H{target}", "repaired": current.repair(target)}
+        result = controls.machine('repair', harvester)
+        return {**result, 'repaired': result['changed']}
 
     @mcp.tool(annotations=CHANGES)
     @guarded(mutating=True)
@@ -232,26 +212,7 @@ def build_server(session, guard: Guard) -> MCPServer:
         """Send the whole fleet at one rectangle of the field first — the strip
         rain is coming to, or the corner that has to be clear for a delivery.
         Rows grow downward, columns rightward, both ends included."""
-        current = sim()
-        bounds = {
-            "top_row": top_row, "left_column": left_column,
-            "bottom_row": bottom_row, "right_column": right_column,
-        }
-        # Not in the schema: the limits are this field's size and change every run.
-        top = as_int(bounds, "top_row", 0, current.field.rows - 1)
-        left = as_int(bounds, "left_column", 0, current.field.cols - 1)
-        bottom = as_int(bounds, "bottom_row", 0, current.field.rows - 1)
-        right = as_int(bounds, "right_column", 0, current.field.cols - 1)
-        promoted = current.prioritize((top, left), (bottom, right))
-        return {
-            "region": {"top": top, "left": left, "bottom": bottom, "right": right},
-            "cells_promoted": promoted,
-            "note": (
-                "no standing crop inside that region"
-                if not promoted
-                else "the fleet works this region first"
-            ),
-        }
+        return controls.prioritize(top_row, left_column, bottom_row, right_column)
 
     @mcp.tool(annotations=CHANGES)
     @guarded(mutating=True)
@@ -264,22 +225,14 @@ def build_server(session, guard: Guard) -> MCPServer:
         raise it when carts are running half empty. wait_weight is how much a
         long wait discounts a cart's bid: raise it when one harvester keeps
         being passed over."""
-        given = {"request_threshold": request_threshold, "wait_weight": wait_weight}
-        threshold = as_float(given, "request_threshold", 0.05, 1.0)
-        weight = as_float(given, "wait_weight", 0.0, 10.0)
-        if threshold is None and weight is None:
-            raise ToolError("give at least one of request_threshold or wait_weight")
-        return sim().set_policy(request_threshold=threshold, wait_weight=weight)
+        return controls.policy(request_threshold, wait_weight)
 
     @mcp.tool(annotations=ADDS)
     @guarded(mutating=True)
     async def add_cart() -> dict:
         """Send one more grain cart out from the farm. The right answer when the
         harvesters are idle waiting to be emptied rather than idle for room."""
-        current = sim()
-        if len(current.carts) >= 6:
-            raise ToolError("six carts is the most this field can hold without gridlock")
-        return {"cart": f"C{current.add_cart()}", "fleet_carts": len(current.carts)}
+        return controls.add_cart()
 
     @mcp.tool(annotations=CHANGES)
     @guarded()
@@ -287,33 +240,19 @@ def build_server(session, guard: Guard) -> MCPServer:
         """Caption the field with one short line saying what you are doing and
         why, in the operator's language. Call it alongside a change so the people
         watching the simulation can follow the reasoning."""
-        text = text.strip()
-        if not text:
-            raise ToolError("say something: 'text' is what gets shown on screen")
-        if len(text) > 160:
-            raise ToolError(
-                f"keep it to 160 characters, that was {len(text)} — it is a caption "
-                "under a field, not a paragraph"
-            )
-        session.narration = {
-            "text": text,
-            "tick": session.sim.tick if session.sim is not None else 0,
-        }
-        return {"shown": text}
+        return controls.announce(text)
 
     @mcp.tool(annotations=CHANGES)
     @guarded()
     async def pause_run() -> dict:
         """Stop advancing ticks; the world keeps its state."""
-        session.pause()
-        return {"status": session.status}
+        return controls.command("pause")
 
     @mcp.tool(annotations=CHANGES)
     @guarded()
     async def resume_run() -> dict:
         """Carry on from the tick where the run stopped."""
-        session.resume()
-        return {"status": session.status}
+        return controls.command("resume")
 
     @mcp.tool(annotations=BREAKS)
     @guarded(mutating=True)
@@ -321,15 +260,47 @@ def build_server(session, guard: Guard) -> MCPServer:
         rows: Optional[int] = None,
         columns: Optional[int] = None,
         new_seed: bool = False,
+        harvesters: Optional[int] = None,
+        carts: Optional[int] = None,
+        min_obstacles: Optional[int] = None,
+        max_obstacles: Optional[int] = None,
+        priority_region: Optional[str] = None,
     ) -> dict:
-        """Rebuild the campaign from tick 1. The field is identical unless
-        new_seed is set, so a demo can be rehearsed and repeated."""
-        session.restart(
-            int(rows) if rows is not None else session.rows,
-            int(columns) if columns is not None else session.cols,
-            new_seed=bool(new_seed),
-        )
-        return {"restarting": True, "rows": session.rows, "columns": session.cols}
+        """Restart with optional field dimensions, harvester and grain-cart counts.
+        Omitted values keep current settings (initially server defaults). Use
+        harvesters=2, carts=2 for two of each; never simulate breakdowns to resize
+        a fleet. The new field exists on return, so prioritize_region can follow.
+        For restart plus north priority, pass priority_region="north" in this call;
+        also accepts south/east/west. No reset/start sequence is needed.
+        Only restart when the operator requests it. Same seed unless new_seed.
+        """
+        result = controls.command('restart', dict(rows=rows, columns=columns,
+            new_seed=new_seed, harvesters=harvesters, carts=carts,
+            min_obstacles=min_obstacles, max_obstacles=max_obstacles, priority_region=priority_region))
+        return {**result, 'restarting': False, 'restarted': True, **result['applied'],
+                'columns': session.cols}
+
+    @mcp.tool(annotations=READS)
+    @guarded()
+    async def get_run_config() -> dict:
+        """Read current/default dimensions and fleet counts, even before starting."""
+        return {**session.parameters(), 'status': session.status, 'ready': session.sim is not None}
+
+    @mcp.tool(annotations=CHANGES)
+    @guarded()
+    async def start_run(rows: Optional[int] = None, columns: Optional[int] = None,
+                        harvesters: Optional[int] = None, carts: Optional[int] = None) -> dict:
+        """Start the first campaign with optional settings, or resume the existing one.
+        Connecting to the server does not start a campaign. Use restart_run to resize.
+        """
+        return controls.command('start', dict(rows=rows, columns=columns,
+                                             harvesters=harvesters, carts=carts))
+
+    @mcp.tool(annotations=BREAKS)
+    @guarded(mutating=True)
+    async def reset_run() -> dict:
+        """Rebuild the same field and fleet, paused at the opening frame."""
+        return controls.command('reset')
 
     return mcp
 
