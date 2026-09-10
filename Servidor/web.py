@@ -46,6 +46,7 @@ from johndeere.config import (
     UNLOAD_TICKS,
     WAIT_WEIGHT,
 )
+from johndeere.recommendation import FleetCostConfig, recommend_fleet_profiles
 from johndeere.world.grid import OBSTACLE
 from Servidor.chat import OpenClawChat
 from Servidor.controls import RunControls
@@ -57,6 +58,44 @@ DASHBOARD = os.path.join(
 #: How long the SSE stream will sit silent before sending a comment to keep the
 #: connection (and any proxy in front of it) from timing the socket out.
 SSE_KEEPALIVE = 15
+
+
+class RecommendationBusy(RuntimeError):
+    pass
+
+
+class RecommendationService:
+    """Run one independent CPU-bound recommendation at a time."""
+
+    def __init__(self, timeout: float):
+        self.timeout = timeout
+        self._lock: Optional[asyncio.Lock] = None
+
+    async def _release_when_done(self, task: asyncio.Task) -> None:
+        try:
+            await task
+        except Exception:
+            pass
+        finally:
+            if self._lock is not None and self._lock.locked():
+                self._lock.release()
+
+    async def run(self, function) -> dict:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        if self._lock.locked():
+            raise RecommendationBusy("a fleet recommendation is already running")
+        await self._lock.acquire()
+        task = asyncio.create_task(asyncio.to_thread(function))
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=self.timeout)
+        finally:
+            if task.done():
+                self._lock.release()
+            else:
+                # A timed-out worker thread cannot be cancelled. Retain the
+                # concurrency slot until it actually finishes.
+                asyncio.create_task(self._release_when_done(task))
 
 
 # --------------------------------------------------------------------------
@@ -292,6 +331,17 @@ def _clamp(value, low: int, high: int) -> int:
 def build_web_app(session, token: Optional[str] = None) -> Starlette:
     """The dashboard app bound to one `Session` — the shared, canonical run."""
 
+    recommendation_enabled = os.getenv(
+        "FLEET_RECOMMENDATIONS_ENABLED", "false"
+    ).lower() in ("1", "true", "yes", "on")
+    try:
+        recommendation_timeout = float(
+            os.getenv("FLEET_RECOMMENDATION_TIMEOUT_SECONDS", "30")
+        )
+    except ValueError:
+        recommendation_timeout = 30.0
+    recommendation_service = RecommendationService(max(0.01, recommendation_timeout))
+
     def authorized(request: Request) -> bool:
         if not token:
             return True
@@ -426,6 +476,121 @@ def build_web_app(session, token: Optional[str] = None) -> Starlette:
             return unauthorized()
         return await chat.handle(request)
 
+    async def post_fleet_recommendations(request: Request) -> Response:
+        if not authorized(request):
+            return unauthorized()
+        body = await _json_body(request)
+        request_id = body.get("requestId")
+        if body.get("schemaVersion") != 1:
+            return JSONResponse({"error": "schemaVersion must be 1"}, status_code=400)
+        if not isinstance(request_id, str) or not request_id:
+            return JSONResponse(
+                {"error": "requestId must be a non-empty string"}, status_code=400
+            )
+        if not recommendation_enabled:
+            return JSONResponse(
+                {"schemaVersion": 1, "requestId": request_id, "status": "disabled",
+                 "error": "fleet recommendations are disabled"},
+                status_code=503,
+            )
+        terrain = body.get("terrain")
+        budget = body.get("budget")
+        if not isinstance(terrain, dict) or not isinstance(budget, dict):
+            return JSONResponse(
+                {"error": "terrain and budget are required"}, status_code=400
+            )
+        try:
+            costs = FleetCostConfig.from_mapping(os.environ)
+        except ValueError as error:
+            return JSONResponse(
+                {"schemaVersion": 1, "requestId": request_id, "status": "error", "error": str(error)},
+                status_code=503,
+            )
+        if budget.get("currency") != costs.currency:
+            return JSONResponse(
+                {"schemaVersion": 1, "requestId": request_id, "status": "error",
+                 "error": f"budget currency must be {costs.currency}"},
+                status_code=400,
+            )
+
+        integers = {
+            "rows": terrain.get("rows"),
+            "columns": terrain.get("columns"),
+            "border": terrain.get("border", 1),
+            "minObstacles": terrain.get("minObstacles", 3),
+            "maxObstacles": terrain.get("maxObstacles", 5),
+            "amount": budget.get("amount"),
+        }
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in integers.values()
+        ):
+            return JSONResponse(
+                {"schemaVersion": 1, "requestId": request_id, "status": "error",
+                 "error": "terrain dimensions, bounds, and budget amount must be integers"},
+                status_code=400,
+            )
+        food_ratio = terrain.get("foodRatio", 1.0)
+        if isinstance(food_ratio, bool) or not isinstance(food_ratio, (int, float)):
+            return JSONResponse(
+                {"schemaVersion": 1, "requestId": request_id, "status": "error",
+                 "error": "foodRatio must be numeric"},
+                status_code=400,
+            )
+        try:
+            seed_count = int(os.getenv("FLEET_RECOMMENDATION_SEED_COUNT", "7"))
+            base_seed = int(os.getenv("FLEET_RECOMMENDATION_BASE_SEED", "42"))
+
+            def calculate() -> dict:
+                return recommend_fleet_profiles(
+                    integers["rows"],
+                    integers["columns"],
+                    budget=integers["amount"],
+                    costs=costs,
+                    seed_count=seed_count,
+                    base_seed=base_seed,
+                    food_ratio=float(food_ratio),
+                    border=integers["border"],
+                    min_obstacles=integers["minObstacles"],
+                    max_obstacles=integers["maxObstacles"],
+                )
+
+            result = await recommendation_service.run(calculate)
+        except RecommendationBusy as error:
+            return JSONResponse(
+                {"schemaVersion": 1, "requestId": request_id, "status": "busy", "error": str(error)},
+                status_code=429,
+            )
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                {
+                    "schemaVersion": 1,
+                    "requestId": request_id,
+                    "status": "timeout",
+                    "error": "recommendation timed out; its worker may still finish internally",
+                },
+                status_code=504,
+            )
+        except ValueError as error:
+            return JSONResponse(
+                {"schemaVersion": 1, "requestId": request_id, "status": "error", "error": str(error)},
+                status_code=400,
+            )
+        except Exception:
+            return JSONResponse(
+                {"schemaVersion": 1, "requestId": request_id, "status": "error",
+                 "error": "fleet recommendation failed"},
+                status_code=500,
+            )
+        return JSONResponse(
+            {
+                "schemaVersion": 1,
+                "requestId": request_id,
+                "status": "completed",
+                **result,
+            }
+        )
+
     routes = [
         Route("/api/chat", post_chat, methods=["POST"]),
         Route("/", get_index, methods=["GET"]),
@@ -444,6 +609,11 @@ def build_web_app(session, token: Optional[str] = None) -> Starlette:
         Route("/api/prioritize", post_prioritize, methods=["POST"]),
         Route("/api/machines/{hid}/{action}", post_machine, methods=["POST"]),
         Route("/api/announce", post_announce, methods=["POST"]),
+        Route(
+            "/api/fleet-recommendations",
+            post_fleet_recommendations,
+            methods=["POST"],
+        ),
     ]
     middleware = [
         Middleware(

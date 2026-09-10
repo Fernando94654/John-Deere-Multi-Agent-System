@@ -22,6 +22,8 @@ class FleetMetrics:
     fuel: float = 0.0
     idle_ticks: int = 0
     traffic_refusals: int = 0
+    max_harvester_wait_ticks: int = 0
+    repeated_traffic: int = 0
 
     @property
     def co2(self) -> float:

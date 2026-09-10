@@ -124,6 +124,9 @@ class Simulation:
         self.collisions = 0
         self.obstacle_violations = 0
         self.rebalances = 0
+        self.max_harvester_wait_ticks = 0
+        self.repeated_traffic = 0
+        self.traffic_heatmap: dict[Cell, int] = {}
         self._idle_window: deque[int] = deque(maxlen=IDLE_WINDOW)
         self._idle_total = 0
 
@@ -243,6 +246,7 @@ class Simulation:
             return
         if self.traffic.claim(agent.label, target, agent.position):
             agent.advance()
+            self._record_traffic(agent.position)
             return
 
         agent.blocked_ticks += 1
@@ -296,6 +300,7 @@ class Simulation:
             if cell != target and self.traffic.claim(agent.label, cell, agent.position):
                 agent.follow([cell])
                 agent.advance()
+                self._record_traffic(agent.position)
                 agent.follow(None)
                 return True
 
@@ -304,6 +309,14 @@ class Simulation:
             agent.defer_target()
             agent.blocked_ticks = 0
         return False
+
+    def _record_traffic(self, cell: Cell) -> None:
+        """Count repeat successful entries without influencing navigation."""
+        if cell == self.farm:
+            return
+        visits = self.traffic_heatmap.get(cell, 0)
+        self.repeated_traffic += int(visits > 0)
+        self.traffic_heatmap[cell] = visits + 1
 
 
     # --- supervision ------------------------------------------------------
@@ -580,6 +593,9 @@ class Simulation:
                 if harvester.state is HarvesterState.WAITING_CART
                 else 0
             )
+            self.max_harvester_wait_ticks = max(
+                self.max_harvester_wait_ticks, harvester.waiting_ticks
+            )
 
         idled = sum(agent.idle_ticks for agent in self.agents)
         self._idle_window.append(idled - self._idle_total)
@@ -658,6 +674,8 @@ class Simulation:
             + sum(c.load for c in self.carts),
             stranded=sum(h.load for h in self.harvesters if h.disabled),
             traffic_refusals=self.traffic.refusals,
+            max_harvester_wait_ticks=self.max_harvester_wait_ticks,
+            repeated_traffic=self.repeated_traffic,
         )
 
     def run(self, on_tick: Optional[Callable[[Snapshot], None]] = None) -> SimulationResult:
