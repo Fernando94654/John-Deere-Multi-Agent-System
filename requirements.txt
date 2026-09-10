@@ -6,3 +6,5 @@ starlette>=0.37      # Servidor/web.py, the dashboard HTTP + SSE API (also via m
 
 # The engine in johndeere/ and the console frontend are stdlib-only, and stay
 # that way: every dependency above belongs to a frontend or to the bridge.
+
+httpx>=0.27         # streaming browser chat through the local OpenClaw gateway
