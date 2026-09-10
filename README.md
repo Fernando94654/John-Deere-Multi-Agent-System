@@ -1030,3 +1030,37 @@ run) never did. All four are also in `/api/decisions`, alongside the agent's own
 [`Servidor/WEB_API.md`](Servidor/WEB_API.md).** The engine gained nothing for this: the
 server keeps a rolling per-tick sample and a per-run summary, and everything else is
 `Simulation.diagnostics()` and the existing command methods behind an HTTP route.
+
+
+### Unified run controls (Web, MCP and Unity)
+
+`./agent/run-demo.sh` now starts the services **idle**, using the server defaults:
+10 rows × 12 columns, 2 harvesters and 2 grain carts. CLI flags override these
+initial defaults. `--autostart` remains an explicit opt-in. Unity's automatic
+`start` handshake only subscribes in shared mode; use Web or MCP to start the run.
+
+All mutations use `Servidor/controls.py`, with lifecycle and atomic field replacement
+in `Session`. Web and MCP share validation and engine operations; their transport
+authentication and the MCP agent's mutation budget remain separate.
+
+- Web: `POST /api/commands/start`, `/restart`, `/reset`, `/pause`, `/continue`;
+  `POST /api/config` uses the same restart function.
+- MCP: `start_run`, `restart_run`, `reset_run`, `pause_run`, `resume_run`, and
+  `get_run_config` (also works before a campaign exists).
+- Restart accepts optional `rows`, `columns`/`cols`, `harvesters`, `carts`, and
+  obstacle counts. Omitted values preserve the last accepted configuration,
+  initially the server defaults. Web also accepts `tractors` as an alias for carts.
+- The new field exists when restart returns (`queued: false`), so a subsequent
+  north-region priority applies to the new campaign. Invalid configurations
+  leave the old field, parameters and run ID untouched. Reset rebuilds paused.
+
+Example MCP: `restart_run(rows=16, columns=22, harvesters=2, carts=2)`, then
+`prioritize_region(top_row=0, left_column=0, bottom_row=7, right_column=21)`.
+Restart the demo after updating so MCP reloads the expanded tool schemas.
+
+Restart also accepts `priority_region` (Web alias `priorityRegion`): `north`,
+`south`, `east`, or `west`. The shared command computes the half-field bounds
+from the new dimensions and applies priority before returning. For a 10-row
+field, north includes rows 0–4. Example: `restart_run(harvesters=2, carts=2,
+priority_region="north")`. Calling start with changed settings on an existing
+run now returns an error pointing to restart instead of silently ignoring them.
