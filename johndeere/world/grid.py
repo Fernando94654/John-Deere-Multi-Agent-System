@@ -56,9 +56,9 @@ def generate_grid(
         raise ValueError("The grid needs at least one row and one column")
     if not 0 <= food_ratio <= 1:
         raise ValueError("food_ratio must be between 0 and 1")
-    if min_obstacles < 1 or max_obstacles < min_obstacles:
+    if min_obstacles < 0 or max_obstacles < min_obstacles:
         raise ValueError(
-            "Obstacle bounds must satisfy 1 <= min_obstacles <= max_obstacles"
+            "Obstacle bounds must satisfy 0 <= min_obstacles <= max_obstacles"
         )
 
     if border < 0:
