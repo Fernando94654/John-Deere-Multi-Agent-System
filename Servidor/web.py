@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from typing import Optional
 
 from starlette.applications import Starlette
@@ -46,6 +47,7 @@ from johndeere.config import (
     UNLOAD_TICKS,
     WAIT_WEIGHT,
 )
+from johndeere.fleet_advisor import FleetCosts, recommend_fleet
 from johndeere.world.grid import OBSTACLE
 from Servidor.chat import OpenClawChat
 from Servidor.controls import RunControls
@@ -57,6 +59,67 @@ DASHBOARD = os.path.join(
 #: How long the SSE stream will sit silent before sending a comment to keep the
 #: connection (and any proxy in front of it) from timing the socket out.
 SSE_KEEPALIVE = 15
+
+#: Longest one operator chat turn may take before the request gives up. The
+#: dashboard aborts its own fetch at 145s; stay just under that so the caller
+#: gets our reason rather than a dead socket.
+CHAT_TIMEOUT = 140
+
+
+async def ask_supervisor(message: str, agent_id: str, session_key: str) -> str:
+    """Run one supervisor turn through the OpenClaw gateway and return its text.
+
+    `openclaw agent --json` talks to the gateway `run-demo.sh` already started,
+    so the gateway address and hook token stay on this server — the browser
+    never sees them. Raises `RuntimeError` with a message safe to show a caller.
+    """
+    binary = shutil.which("openclaw")
+    if binary is None:
+        raise RuntimeError(
+            "openclaw is not on the server's PATH, so the gateway bridge is off"
+        )
+
+    proc = await asyncio.create_subprocess_exec(
+        binary, "agent",
+        "--agent", agent_id,
+        "--session-key", session_key,
+        "--json",
+        "--message", message,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=CHAT_TIMEOUT)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError("the supervisor did not answer in time")
+
+    if proc.returncode != 0:
+        tail = (err or b"").decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError(tail[-1] if tail else f"openclaw agent exited {proc.returncode}")
+
+    try:
+        data = json.loads(out.decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        raise RuntimeError("the gateway returned an unreadable response")
+
+    if data.get("status") not in (None, "ok"):
+        raise RuntimeError(
+            str(data.get("summary") or data.get("error") or "the turn did not complete")
+        )
+
+    result = data.get("result") or {}
+    reply = str((result.get("meta") or {}).get("finalAssistantVisibleText") or "").strip()
+    if not reply:
+        reply = "".join(
+            p.get("text", "")
+            for p in (result.get("payloads") or [])
+            if isinstance(p, dict)
+        ).strip()
+    if not reply:
+        raise RuntimeError("the supervisor returned an empty reply")
+    return reply
 
 
 # --------------------------------------------------------------------------
@@ -292,6 +355,12 @@ def _clamp(value, low: int, high: int) -> int:
 def build_web_app(session, token: Optional[str] = None) -> Starlette:
     """The dashboard app bound to one `Session` — the shared, canonical run."""
 
+    # Fleet recommendations are a what-if the operator turns on: it needs unit
+    # prices in the environment, so it stays off until FLEET_RECOMMENDATIONS_ENABLED.
+    recommendation_enabled = os.getenv(
+        "FLEET_RECOMMENDATIONS_ENABLED", "false"
+    ).lower() in ("1", "true", "yes", "on")
+
     def authorized(request: Request) -> bool:
         if not token:
             return True
@@ -426,6 +495,104 @@ def build_web_app(session, token: Optional[str] = None) -> Starlette:
             return unauthorized()
         return await chat.handle(request)
 
+    async def post_chat(request: Request) -> Response:
+        """Relay one operator message to the supervisor and return its reply.
+
+        The dashboard has no path to the gateway of its own; this is it. The run
+        does not have to be going — the agent can answer about a paused or
+        not-yet-started campaign too.
+        """
+        if not authorized(request):
+            return unauthorized()
+        body = await _json_body(request)
+        message = str(body.get("message", "")).strip()
+        if not message:
+            return JSONResponse({"error": "message must not be empty"}, status_code=400)
+        if len(message) > 4000:
+            return JSONResponse(
+                {"error": "message must be 4000 characters or fewer"}, status_code=400
+            )
+
+        args = session.args
+        agent_id = getattr(args, "wake_agent", None) or "farm-manager"
+        session_key = getattr(args, "wake_session", None) or "harvest"
+        try:
+            reply = await ask_supervisor(message, agent_id, session_key)
+        except RuntimeError as error:
+            log("chat", {"message": message}, f"failed: {error}")
+            return JSONResponse({"error": str(error)}, status_code=502)
+        log("chat", {"message": message}, reply[:120])
+        return JSONResponse({"reply": reply})
+
+    async def post_fleet_recommendations(request: Request) -> Response:
+        """Size a harvester/cart fleet for a field and a budget.
+
+        A pure what-if — it reads no live run and changes nothing. The reply
+        carries the client's `schemaVersion`/`requestId` back so a request and
+        its answer can be matched. Off unless FLEET_RECOMMENDATIONS_ENABLED, and
+        it needs the FLEET_COST_* unit prices in the environment.
+        """
+        if not authorized(request):
+            return unauthorized()
+        body = await _json_body(request)
+        request_id = body.get("requestId")
+        if body.get("schemaVersion") != 1:
+            return JSONResponse({"error": "schemaVersion must be 1"}, status_code=400)
+        if not isinstance(request_id, str) or not request_id:
+            return JSONResponse(
+                {"error": "requestId must be a non-empty string"}, status_code=400
+            )
+
+        envelope = {"schemaVersion": 1, "requestId": request_id}
+        if not recommendation_enabled:
+            return JSONResponse(
+                {**envelope, "status": "disabled",
+                 "error": "fleet recommendations are disabled"},
+                status_code=503,
+            )
+
+        terrain = body.get("terrain")
+        budget = body.get("budget")
+        if not isinstance(terrain, dict) or not isinstance(budget, dict):
+            return JSONResponse(
+                {**envelope, "status": "error", "error": "terrain and budget objects are required"},
+                status_code=400,
+            )
+        try:
+            costs = FleetCosts.from_env()
+        except ValueError as error:
+            return JSONResponse(
+                {**envelope, "status": "error", "error": str(error)}, status_code=503
+            )
+        if budget.get("currency") != costs.currency:
+            return JSONResponse(
+                {**envelope, "status": "error",
+                 "error": f"budget currency must be {costs.currency}"},
+                status_code=400,
+            )
+
+        try:
+            result = recommend_fleet(
+                terrain.get("rows"),
+                terrain.get("columns"),
+                budget=budget.get("amount"),
+                costs=costs,
+                border=terrain.get("border", 1),
+                min_obstacles=terrain.get("minObstacles", 3),
+                max_obstacles=terrain.get("maxObstacles", 5),
+                food_ratio=terrain.get("foodRatio", 1.0),
+            )
+        except (ValueError, TypeError) as error:
+            return JSONResponse(
+                {**envelope, "status": "error", "error": str(error)}, status_code=400
+            )
+        except Exception:
+            return JSONResponse(
+                {**envelope, "status": "error", "error": "fleet recommendation failed"},
+                status_code=500,
+            )
+        return JSONResponse({**envelope, "status": "completed", **result})
+
     routes = [
         Route("/api/chat", post_chat, methods=["POST"]),
         Route("/", get_index, methods=["GET"]),
@@ -444,6 +611,8 @@ def build_web_app(session, token: Optional[str] = None) -> Starlette:
         Route("/api/prioritize", post_prioritize, methods=["POST"]),
         Route("/api/machines/{hid}/{action}", post_machine, methods=["POST"]),
         Route("/api/announce", post_announce, methods=["POST"]),
+        Route("/api/chat", post_chat, methods=["POST"]),
+        Route("/api/fleet-recommendations", post_fleet_recommendations, methods=["POST"]),
     ]
     middleware = [
         Middleware(
