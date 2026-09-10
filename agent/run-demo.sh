@@ -185,6 +185,16 @@ kill -0 "$GW_PID" 2>/dev/null && ss -ltn 2>/dev/null | grep -q ":$PORT\b" || {
   tail -5 "$GW_LOG" >&2; exit 1; }
 echo "  gateway ready on :$PORT"
 
+# Fleet recommendations (POST /api/fleet-recommendations): on for the demo, with
+# a placeholder price list. Every value defers to one already in the environment,
+# so `FLEET_HARVESTER_COST=90 ./agent/run-demo.sh` still wins, and
+# `FLEET_RECOMMENDATIONS_ENABLED=0 ./agent/run-demo.sh` turns it back off.
+export FLEET_RECOMMENDATIONS_ENABLED="${FLEET_RECOMMENDATIONS_ENABLED:-1}"
+export FLEET_COST_CURRENCY="${FLEET_COST_CURRENCY:-MXN}"
+export FLEET_COST_VERSION="${FLEET_COST_VERSION:-demo-2026-09}"
+export FLEET_HARVESTER_COST="${FLEET_HARVESTER_COST:-100}"
+export FLEET_CART_COST="${FLEET_CART_COST:-40}"
+
 # server.py args. Field defaults match the old demo; anything in "$@" is
 # appended, so a flag you pass on the command line overrides the default.
 SIM_ARGS=(--with-mcp)
